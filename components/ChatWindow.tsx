@@ -1,11 +1,12 @@
 "use client";
 import { registerAbortHandler } from "@/hooks/useKeyboardShortcuts";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, CustomMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage, UserMessage } from "@/lib/types";
+import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, CustomMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage, ToolCallContent, UserMessage } from "@/lib/types";
 import { normalizeCustomPanelLines, parseAnsiLine } from "@/lib/ansi";
 import { asBracketedPaste, toTerminalKeyData } from "@/lib/terminal-input";
-import { countToolCallBlocks, getAssistantErrorMessage, getDisplayableAssistantBlocks, splitFinalAssistantBlocks } from "@/lib/message-display";
+import { countToolCallBlocks, getAssistantErrorMessage, getDisplayableAssistantBlocks, isVisualToolCallBlock, splitFinalAssistantBlocks } from "@/lib/message-display";
 import { MessageView } from "./MessageView";
+import { VideoPreview } from "./VideoPreview";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
 import { ExtensionStatusBar } from "./ExtensionStatusBar";
@@ -56,10 +57,132 @@ const CHAT_MINIMAP_WIDTH = 36;
 const CHAT_COLUMN_PADDING = 16;
 const CHAT_INPUT_RIGHT_PADDING = CHAT_COLUMN_PADDING + CHAT_MINIMAP_WIDTH;
 
+interface VideoPreviewInfo {
+  mediaUrl: string;
+  mediaCandidates?: string[];
+  label: string;
+  bytes?: number;
+  refresh?: { node: string; path: string };
+}
+
+interface ImagePreviewInfo {
+  src: string;
+  label: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function videoPreviewFromBlock(
+  block: AssistantContentBlock,
+  toolResults: Map<string, ToolResultMessage>,
+): VideoPreviewInfo | null {
+  if (block.type !== "toolCall" || !isVisualToolCallBlock(block)) return null;
+
+  const result = toolResults.get(block.toolCallId);
+  if (result?.isError) return null;
+  if (result && isRecord(result.details)) {
+    const details = result.details;
+    if (details.mediaType === "video" && typeof details.mediaUrl === "string" && details.mediaUrl) {
+      const mediaCandidates = Array.isArray(details.mediaCandidates)
+        ? details.mediaCandidates.filter((candidate): candidate is string => typeof candidate === "string" && candidate.length > 0)
+        : undefined;
+      return {
+        mediaUrl: details.mediaUrl,
+        mediaCandidates: mediaCandidates?.length ? mediaCandidates : undefined,
+        label: typeof details.label === "string" ? details.label : "Remote video",
+        bytes: typeof details.bytes === "number" ? details.bytes : undefined,
+        refresh: typeof details.node === "string" && typeof details.path === "string"
+          ? { node: details.node, path: details.path }
+          : undefined,
+      };
+    }
+  }
+
+  const input = isRecord(block.input) ? block.input : {};
+  const node = typeof input.node === "string" ? input.node : "";
+  const remotePath = typeof input.path === "string" ? input.path : "";
+  if (!node || !remotePath || !/\.(mp4|webm|mov|m4v|ogv)$/i.test(remotePath)) return null;
+  return {
+    mediaUrl: `/api/node-media?node=${encodeURIComponent(node)}&path=${encodeURIComponent(remotePath)}`,
+    label: remotePath,
+    refresh: { node, path: remotePath },
+  };
+}
+
+function videoPreviewsFromBlocks(
+  blocks: AssistantContentBlock[],
+  toolResults: Map<string, ToolResultMessage>,
+): VideoPreviewInfo[] {
+  const seen = new Set<string>();
+  const previews: VideoPreviewInfo[] = [];
+  for (const block of blocks) {
+    const preview = videoPreviewFromBlock(block, toolResults);
+    if (!preview || seen.has(preview.mediaUrl)) continue;
+    seen.add(preview.mediaUrl);
+    previews.push(preview);
+  }
+  return previews;
+}
+
+function VideoPreviewList({ previews }: { previews: VideoPreviewInfo[] }) {
+  if (previews.length === 0) return null;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
+      {previews.map((preview) => (
+        <VideoPreview key={preview.mediaUrl} src={preview.mediaUrl} candidates={preview.mediaCandidates} label={preview.label} bytes={preview.bytes} refresh={preview.refresh} />
+      ))}
+    </div>
+  );
+}
+
+function imageSourceFromToolResult(result: ToolResultMessage | undefined): string | null {
+  if (!result || result.isError) return null;
+  const image = result.content.find((block) => block.type === "image") as unknown as Record<string, unknown> | undefined;
+  if (!image) return null;
+  const source = image.source;
+  if (isRecord(source)) {
+    if (source.type === "url" && typeof source.url === "string") return source.url;
+    if (source.type === "base64" && typeof source.data === "string") return `data:${typeof source.media_type === "string" ? source.media_type : "image/png"};base64,${source.data}`;
+  }
+  if (typeof image.data === "string") return `data:${typeof image.mimeType === "string" ? image.mimeType : "image/png"};base64,${image.data}`;
+  return null;
+}
+
+function imagePreviewsFromBlocks(blocks: AssistantContentBlock[], toolResults: Map<string, ToolResultMessage>): ImagePreviewInfo[] {
+  const previews: ImagePreviewInfo[] = [];
+  const seen = new Set<string>();
+  for (const block of blocks) {
+    if (block.type !== "toolCall") continue;
+    const legacy = block as ToolCallContent & { name?: unknown };
+    if (block.toolName !== "node_image" && legacy.name !== "node_image") continue;
+    const src = imageSourceFromToolResult(toolResults.get(block.toolCallId));
+    if (!src || seen.has(src)) continue;
+    seen.add(src);
+    previews.push({ src, label: "Remote image" });
+  }
+  return previews;
+}
+
+function ImagePreviewList({ previews }: { previews: ImagePreviewInfo[] }) {
+  if (previews.length === 0) return null;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
+      {previews.map((preview) => (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img key={preview.src} src={preview.src} alt={preview.label} style={{ maxWidth: "100%", maxHeight: 640, borderRadius: 6, objectFit: "contain", border: "1px solid var(--border)" }} />
+      ))}
+    </div>
+  );
+}
+
 function hasFinalAssistantAnswer(message: AgentMessage): boolean {
   if (message.role !== "assistant") return false;
   return splitFinalAssistantBlocks(message as AssistantMessage).answerBlocks.some((block) => (
-    block.type === "image" || (block.type === "text" && block.text.trim().length > 0)
+    isVisualToolCallBlock(block)
+    || block.type === "image"
+    || (block.type === "text" && block.text.trim().length > 0)
   ));
 }
 
@@ -752,17 +875,37 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                 for (let processIdx = userIdx + 1; processIdx < finalAssistantIdx; processIdx++) {
                   processIndices.push(processIdx);
                 }
-                const visibleProcessIndices = processIndices.filter((processIdx) => hasDisplayableProcessMessage(messages[processIdx]));
+                // A node_video result is a visual answer, not collapsible
+                // process/COT. Remove its assistant message from the process
+                // group and render its preview as a sibling below the group.
+                const visualProcessIndices = processIndices.filter((processIdx) => {
+                  const message = messages[processIdx];
+                  return message?.role === "assistant"
+                    && message.content.some((block) => isVisualToolCallBlock(block));
+                });
+                const visibleProcessIndices = processIndices.filter((processIdx) => {
+                  const message = messages[processIdx];
+                  return hasDisplayableProcessMessage(message)
+                    && !(message?.role === "assistant" && message.content.some((block) => isVisualToolCallBlock(block)));
+                });
                 const finalAssistant = messages[finalAssistantIdx] as AssistantMessage;
                 const finalSplit = splitFinalAssistantBlocks(finalAssistant);
-                const finalProcessMessage = finalSplit.processBlocks.length > 0
-                  ? withAssistantBlocks(finalAssistant, finalSplit.processBlocks, { omitUsage: true })
+                const cleanFinalProcessBlocks = finalSplit.processBlocks.filter((block) => !isVisualToolCallBlock(block));
+                const finalProcessMessage = cleanFinalProcessBlocks.length > 0
+                  ? withAssistantBlocks(finalAssistant, cleanFinalProcessBlocks, { omitUsage: true })
                   : null;
                 const finalAnswerMessage = finalSplit.answerBlocks.length > 0 || getAssistantErrorMessage(finalAssistant)
                   ? withAssistantBlocks(finalAssistant, finalSplit.answerBlocks)
                   : null;
 
                 const processCount = visibleProcessIndices.length + (finalProcessMessage ? 1 : 0);
+                const visualBlocks = visualProcessIndices.flatMap((processIdx) => {
+                  const message = messages[processIdx];
+                  return message?.role === "assistant" ? getDisplayableAssistantBlocks(message as AssistantMessage) : [];
+                });
+                const visualBlocksForPreview = [...visualBlocks, ...finalSplit.processBlocks];
+                const visualPreviews = videoPreviewsFromBlocks(visualBlocksForPreview, toolResultsMap);
+                const imagePreviews = imagePreviewsFromBlocks(visualBlocksForPreview, toolResultsMap);
                 if (processCount > 0) {
                   const processRefIdx = visibleProcessIndices
                     .map((processIdx) => visibleRefIndexByMessage.get(processIdx))
@@ -772,7 +915,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                     <ProcessDetailsGroup
                        messageCount={processCount}
                        t={t}
-                      toolCallCount={countToolCalls(messages, visibleProcessIndices) + countToolCallBlocks(finalSplit.processBlocks)}
+                      toolCallCount={countToolCalls(messages, visibleProcessIndices) + countToolCallBlocks(cleanFinalProcessBlocks)}
                     >
                       {visibleProcessIndices.map((processIdx) => renderMessage(processIdx, { attachRef: false, keyPrefix: "process" }))}
                       {finalProcessMessage && renderMessage(finalAssistantIdx, { attachRef: false, keyPrefix: "process-final", messageOverride: finalProcessMessage, showTimestamp: false })}
@@ -785,6 +928,15 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                     >
                       {processGroup}
                     </div>,
+                  );
+                }
+
+                if (visualPreviews.length > 0 || imagePreviews.length > 0) {
+                  rendered.push(
+                    <Fragment key={`visual-previews-${userIdx}-${finalAssistantIdx}`}>
+                      <VideoPreviewList previews={visualPreviews} />
+                      <ImagePreviewList previews={imagePreviews} />
+                    </Fragment>,
                   );
                 }
 

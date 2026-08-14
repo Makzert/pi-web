@@ -2,10 +2,11 @@
 
 import { memo, useState, useRef, useEffect, useMemo } from "react";
 import { MarkdownBody } from "./MarkdownBody";
+import { VideoPreview } from "./VideoPreview";
 import { copyText } from "@/lib/clipboard";
 import { useI18n } from "@/hooks/useI18n";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
-import { getAssistantErrorMessage, isEmptyThinkingBlock } from "@/lib/message-display";
+import { getAssistantErrorMessage, isEmptyThinkingBlock, isVisualToolCallBlock } from "@/lib/message-display";
 import { parseUnifiedPatch, type SplitDiffCell } from "@/lib/patch";
 import { skillExpansionToCommand } from "@/lib/slash-display";
 import type {
@@ -700,6 +701,73 @@ function AssistantMessageView({
   );
 }
 
+interface VideoResult {
+  mediaUrl: string;
+  mediaCandidates?: string[];
+  label: string;
+  bytes?: number;
+  refresh?: { node: string; path: string };
+}
+
+function getVideoResult(result: ToolResultMessage | undefined): VideoResult | null {
+  const details = result?.details;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return null;
+  const record = details as Record<string, unknown>;
+  if (result?.isError || record.mediaType !== "video" || typeof record.mediaUrl !== "string" || !record.mediaUrl) return null;
+  const mediaCandidates = Array.isArray(record.mediaCandidates)
+    ? record.mediaCandidates.filter((candidate): candidate is string => typeof candidate === "string" && candidate.length > 0)
+    : undefined;
+  return {
+    mediaUrl: record.mediaUrl,
+    mediaCandidates: mediaCandidates?.length ? mediaCandidates : undefined,
+    label: typeof record.label === "string" ? record.label : "Remote video",
+    bytes: typeof record.bytes === "number" ? record.bytes : undefined,
+    refresh: typeof record.node === "string" && typeof record.path === "string"
+      ? { node: record.node, path: record.path }
+      : undefined,
+  };
+}
+
+function getVideoFromToolCall(block: ToolCallContent): VideoResult | null {
+  const legacy = block as ToolCallContent & { name?: unknown; arguments?: unknown };
+  const input = block.input && typeof block.input === "object"
+    ? block.input
+    : (legacy.arguments && typeof legacy.arguments === "object" && !Array.isArray(legacy.arguments)
+      ? legacy.arguments as Record<string, unknown>
+      : {});
+  const node = typeof input.node === "string" ? input.node : "";
+  const remotePath = typeof input.path === "string" ? input.path : "";
+  if (!node || !remotePath || !/\.(mp4|webm|mov|m4v|ogv)$/i.test(remotePath)) return null;
+  return {
+    mediaUrl: `/api/node-media?node=${encodeURIComponent(node)}&path=${encodeURIComponent(remotePath)}`,
+    label: remotePath,
+    refresh: { node, path: remotePath },
+  };
+}
+
+function VideoToolResult({ block, result }: { block: ToolCallContent; result?: ToolResultMessage }) {
+  const video = getVideoResult(result) ?? getVideoFromToolCall(block);
+  if (!video) return null;
+  return <VideoPreview src={video.mediaUrl} candidates={video.mediaCandidates} label={video.label} bytes={video.bytes} refresh={video.refresh} />;
+}
+
+function ImageToolResult({ result }: { result?: ToolResultMessage }) {
+  if (!result || result.isError) return null;
+  const images = result.content
+    .filter((block): block is ImageContent => block.type === "image")
+    .map(imageSource)
+    .filter((src): src is string => Boolean(src));
+  if (images.length === 0) return null;
+  return (
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+      {images.map((src, index) => (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img key={index} src={src} alt="Tool output" style={{ maxWidth: "100%", maxHeight: 640, borderRadius: 6, objectFit: "contain", border: "1px solid var(--border)" }} />
+      ))}
+    </div>
+  );
+}
+
 function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCallDurations, cwd, onOpenFile, sessionId, entryId, blockIndex }: { block: AssistantContentBlock; toolResults?: Map<string, ToolResultMessage>; isStreaming?: boolean; streamingDuration?: number; toolCallDurations?: Map<string, number>; cwd?: string; onOpenFile?: (filePath: string) => void; sessionId?: string; entryId?: string; blockIndex: number }) {
   if (block.type === "text") {
     return <TextBlock block={block as TextContent} isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile} />;
@@ -711,6 +779,13 @@ function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCal
     const tc = block as ToolCallContent;
     const result = toolResults?.get(tc.toolCallId);
     const duration = toolCallDurations?.get(tc.toolCallId);
+    if (isVisualToolCallBlock(tc)) {
+      return result?.isError
+        ? <ToolCallBlock block={tc} result={result} duration={duration} />
+        : (tc.toolName === "node_image" || (tc as ToolCallContent & { name?: unknown }).name === "node_image")
+          ? <ImageToolResult result={result} />
+          : <VideoToolResult block={tc} result={result} />;
+    }
     return <ToolCallBlock block={tc} result={result} duration={duration} />;
   }
   return null;

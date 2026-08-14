@@ -23,8 +23,17 @@ export function getAssistantErrorMessage(
   return message.errorMessage?.trim() || "Unknown provider error";
 }
 
-function isFinalAnswerBlock(block: AssistantContentBlock): boolean {
-  return block.type === "text" || block.type === "image";
+export function isVisualToolCallBlock(block: AssistantContentBlock): boolean {
+  if (block.type !== "toolCall") return false;
+  const legacy = block as ToolCallContent & { name?: unknown };
+  return block.toolName === "node_video"
+    || block.toolName === "node_image"
+    || legacy.name === "node_video"
+    || legacy.name === "node_image";
+}
+
+export function isFinalAnswerBlock(block: AssistantContentBlock): boolean {
+  return block.type === "text" || block.type === "image" || isVisualToolCallBlock(block);
 }
 
 export function splitFinalAssistantBlocks(
