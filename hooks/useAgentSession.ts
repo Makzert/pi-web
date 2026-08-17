@@ -163,7 +163,13 @@ const SCROLL_BOTTOM_THRESHOLD = 150;
 const PROMPT_SETTLE_INITIAL_DELAY_MS = 800;
 const PROMPT_SETTLE_POLL_MS = 600;
 const PROMPT_SETTLE_MAX_MS = 20_000;
-const EVENT_STREAM_IDLE_GRACE_MS = 30_000;
+// Gateway background watchers have a 24-hour hard deadline. Keep the session
+// SSE subscribed for that same window after a prompt settles so an extension
+// event can wake the original session even when the task completes much later.
+// The server sends a heartbeat every 30s, so an idle EventSource remains a
+// cheap live subscription and can receive the eventual custom_message and
+// follow-up assistant turn without requiring another user prompt.
+const EVENT_STREAM_IDLE_GRACE_MS = 24 * 60 * 60 * 1_000;
 const AGENT_STATE_RECONCILE_MS = 15_000;
 const BASH_STATE_RECONCILE_MS = 1_000;
 const EVENT_STREAM_CONNECT_TIMEOUT_MS = 5_000;

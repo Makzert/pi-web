@@ -293,7 +293,12 @@ export class AgentSessionWrapper {
   private resetIdleTimer(): void {
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => {
-      if (this.isRunning()) {
+      // An open SSE subscriber represents a live Web session. Keep the
+      // AgentSession alive while it is subscribed so delayed extension events
+      // (for example Gateway background-job results) still have a sink even
+      // after the original prompt has settled. When the browser disconnects,
+      // the normal idle timeout resumes and releases the runtime.
+      if (this.isRunning() || this.listeners.length > 0) {
         this.resetIdleTimer();
         return;
       }
@@ -325,6 +330,7 @@ export class AgentSessionWrapper {
 
   onEvent(listener: EventListener): () => void {
     this.listeners.push(listener);
+    this.resetIdleTimer();
     for (const event of this.pendingUiRequests.values()) listener(event);
     return () => {
       const i = this.listeners.indexOf(listener);
