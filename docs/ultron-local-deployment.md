@@ -1,34 +1,35 @@
 # Ultron Pi Web 本地定制持久化
 
-Ultron 的前端定制以本仓库源码为唯一事实来源，不以全局 npm 包或手工复制的 `.next` 为来源。
-
-当前 launchd 服务 `com.pi.web` 通过本仓库的 `scripts/start-ultron-pi-web.sh` 直接启动生产构建；`/Users/Admin/.pi/agent/start-pi-web.sh` 只保留密码、代理等机器配置：
+Ultron 的品牌和前端产物定制是**安装后重放层**，唯一事实来源是：
 
 ```text
-/Users/Admin/.zcode/workspace/default/ultron/pi-web
+/Users/Admin/.zcode/workspace/default/pi-web/customize.sh
+/Users/Admin/.zcode/workspace/default/pi-web/ensure-customized.sh
 ```
 
-因此 `npm install -g @agegr/pi-web` 不会再覆盖正在运行的 Ultron 定制。全局包只保留作显式回退（设置 `PI_WEB_USE_GLOBAL=1`）。
+launchd 仍然运行全局 `@agegr/pi-web`，但 `/Users/Admin/.pi/agent/start-pi-web.sh` 每次启动前会先调用 `ensure-customized.sh`。因此 npm 更新覆盖全局包后，服务启动会自动恢复标题、Logo、Service Worker 版本和 chunk 缓存突破规则。
+
+全局包可以被 npm 替换；替换本身不是问题，关键是必须通过重放脚本启动服务，不能直接启动裸包。
 
 ## 更新流程
 
 ```bash
-cd /Users/Admin/.zcode/workspace/default/ultron/pi-web
-git status                         # 确认定制已提交或明确保留
-git pull --rebase                  # 合并上游时让 Git 暴露冲突
-npm ci                             # 仅在 package-lock 变化或依赖需要重装时执行
-npm run build
+~/.zcode/workspace/default/pi-web/update.sh
+# 或只重放当前定制：
+~/.zcode/workspace/default/pi-web/customize.sh
+# 启动前自动检查并重放（幂等）：
+~/.zcode/workspace/default/pi-web/ensure-customized.sh
 launchctl kickstart -k gui/$(id -u)/com.pi.web
 ```
 
-源码修改必须提交到 Git；不要只修改全局安装目录中的 `.next`，也不要把全局 npm 包作为定制备份。服务重启后会从源码仓库最新的 `.next` 启动。
+`customize.sh` 和 `update.sh` 必须保留在独立的定制目录中；不要只修改全局安装目录里的 `.next` 或 `public`。`customize.sh` 支持 `PI_WEB_CUSTOMIZE_NO_RESTART=1`，供启动前检查使用，并且会排除旧的 `ULTURON` chunk，避免重放时误选旧文件。
 
-## 回退到上游包
+## 跳过自动重放
 
 只有需要对比原版时才使用：
 
 ```bash
-PI_WEB_USE_GLOBAL=1 launchctl kickstart -k gui/$(id -u)/com.pi.web
+PI_WEB_SKIP_CUSTOMIZE=1 launchctl kickstart -k gui/$(id -u)/com.pi.web
 ```
 
-恢复 Ultron 定制时清除该环境变量并重新 kickstart 服务即可。
+恢复自动重放时清除该环境变量并重新 kickstart 服务即可。
