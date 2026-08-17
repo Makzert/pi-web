@@ -499,19 +499,31 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setData(d);
       setActiveLeafId(d.leafId);
       setMessages(d.context.messages);
-      const hasBackgroundResult = d.context.messages.some((message) => {
-        const candidate = message as AgentMessage & { customType?: string };
-        return candidate.customType === "node-bg-result";
+      // A session can contain many completed background jobs. Only the
+      // relative order of the newest accepted-background tool result and the
+      // newest node-bg-result tells us whether a job is still pending; looking
+      // for any historical result would incorrectly suppress polling for a
+      // newer job.
+      let lastBackgroundTool = -1;
+      let lastBackgroundResult = -1;
+      d.context.messages.forEach((message, index) => {
+        const candidate = message as AgentMessage & { customType?: string; details?: Record<string, unknown> };
+        const text = extractMessageText(candidate);
+        if (candidate.customType === "node-bg-result") lastBackgroundResult = index;
+        if (
+          candidate.role === "toolResult"
+          && (
+            candidate.details?.backgrounded === true
+            || candidate.details?.watcher === "gateway"
+            || text.includes("NODE_EXEC_ACCEPTED_BACKGROUND")
+            || (text.includes("Background job started") && !text.includes("NODE_BG_FINAL_RESULT"))
+          )
+        ) lastBackgroundTool = index;
       });
-      const hasBackgroundTool = d.context.messages.some((message) => {
-        const candidate = message as AgentMessage & { details?: Record<string, unknown> };
-        return candidate.role === "toolResult"
-          && (candidate.details?.backgrounded === true || candidate.details?.watcher === "gateway");
-      });
-      if (hasBackgroundResult) {
+      if (lastBackgroundResult >= lastBackgroundTool && lastBackgroundResult >= 0) {
         backgroundPendingRef.current = false;
         setBackgroundPending(false);
-      } else if (hasBackgroundTool) {
+      } else if (lastBackgroundTool > lastBackgroundResult) {
         backgroundPendingRef.current = true;
         setBackgroundPending(true);
       }
@@ -1265,7 +1277,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         if (!agentRunningRef.current) break;
         const completed = event.message as AgentMessage | undefined;
         const completedDetails = (completed as AgentMessage & { details?: Record<string, unknown> } | undefined)?.details;
-        if (completed?.role === "toolResult" && (completedDetails?.backgrounded === true || completedDetails?.watcher === "gateway")) {
+        const completedText = completed ? extractMessageText(completed) : "";
+        if (completed?.role === "toolResult" && (
+          completedDetails?.backgrounded === true
+          || completedDetails?.watcher === "gateway"
+          || completedText.includes("NODE_EXEC_ACCEPTED_BACKGROUND")
+          || (completedText.includes("Background job started") && !completedText.includes("NODE_BG_FINAL_RESULT"))
+        )) {
           backgroundPendingRef.current = true;
           setBackgroundPending(true);
         }
