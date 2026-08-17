@@ -293,12 +293,10 @@ export class AgentSessionWrapper {
   private resetIdleTimer(): void {
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => {
-      // An open SSE subscriber represents a live Web session. Keep the
-      // AgentSession alive while it is subscribed so delayed extension events
-      // (for example Gateway background-job results) still have a sink even
-      // after the original prompt has settled. When the browser disconnects,
-      // the normal idle timeout resumes and releases the runtime.
-      if (this.isRunning() || this.listeners.length > 0) {
+      // SSE is only a low-latency accelerator. The session JSONL plus the
+      // sync/wake endpoint are the durable recovery path, so subscribers must
+      // not disable the normal idle shutdown.
+      if (this.isRunning()) {
         this.resetIdleTimer();
         return;
       }

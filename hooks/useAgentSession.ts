@@ -19,12 +19,19 @@ export interface SessionData {
   filePath: string;
   tree: SessionTreeNode[];
   leafId: string | null;
+  revision?: SessionRevision;
   context: {
     messages: AgentMessage[];
     entryIds: string[];
     thinkingLevel: string;
     model: { provider: string; modelId: string } | null;
   };
+}
+
+interface SessionRevision {
+  lastEntryId: string | null;
+  modifiedMs: number;
+  size: number;
 }
 
 interface StreamingState {
@@ -163,13 +170,9 @@ const SCROLL_BOTTOM_THRESHOLD = 150;
 const PROMPT_SETTLE_INITIAL_DELAY_MS = 800;
 const PROMPT_SETTLE_POLL_MS = 600;
 const PROMPT_SETTLE_MAX_MS = 20_000;
-// Gateway background watchers have a 24-hour hard deadline. Keep the session
-// SSE subscribed for that same window after a prompt settles so an extension
-// event can wake the original session even when the task completes much later.
-// The server sends a heartbeat every 30s, so an idle EventSource remains a
-// cheap live subscription and can receive the eventual custom_message and
-// follow-up assistant turn without requiring another user prompt.
-const EVENT_STREAM_IDLE_GRACE_MS = 24 * 60 * 60 * 1_000;
+// SSE is a short-lived latency optimization. Background tasks are recovered
+// through the session revision + sync/wake loop below.
+const EVENT_STREAM_IDLE_GRACE_MS = 30_000;
 const AGENT_STATE_RECONCILE_MS = 15_000;
 const BASH_STATE_RECONCILE_MS = 1_000;
 const EVENT_STREAM_CONNECT_TIMEOUT_MS = 5_000;
@@ -388,6 +391,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [extensionStatuses, setExtensionStatuses] = useState<ExtensionStatusItem[]>([]);
   const [extensionWidgets, setExtensionWidgets] = useState<ExtensionWidgetItem[]>([]);
   const [queuedMessages, setQueuedMessages] = useState<QueuedMessages>({ steering: [], followUp: [] });
+  const [backgroundPending, setBackgroundPending] = useState(false);
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const eventSourceSessionIdRef = useRef<string | null>(null);
@@ -420,6 +424,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const thinkingLevelOverrideRef = useRef<Exclude<ThinkingLevelOption, "auto"> | null>(null);
   const promptRunIdRef = useRef(0);
   const optimisticUserMessageKeyRef = useRef<string | null>(null);
+  const backgroundPendingRef = useRef(false);
+  const backgroundSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sessionRevisionRef = useRef<SessionRevision | null>(null);
 
   const setToolPresetState = opts.setToolPreset ?? setToolPreset;
 
@@ -488,9 +495,26 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as SessionData;
       if (sessionIdRef.current !== sid) return null;
+      if (d.revision) sessionRevisionRef.current = d.revision;
       setData(d);
       setActiveLeafId(d.leafId);
       setMessages(d.context.messages);
+      const hasBackgroundResult = d.context.messages.some((message) => {
+        const candidate = message as AgentMessage & { customType?: string };
+        return candidate.customType === "node-bg-result";
+      });
+      const hasBackgroundTool = d.context.messages.some((message) => {
+        const candidate = message as AgentMessage & { details?: Record<string, unknown> };
+        return candidate.role === "toolResult"
+          && (candidate.details?.backgrounded === true || candidate.details?.watcher === "gateway");
+      });
+      if (hasBackgroundResult) {
+        backgroundPendingRef.current = false;
+        setBackgroundPending(false);
+      } else if (hasBackgroundTool) {
+        backgroundPendingRef.current = true;
+        setBackgroundPending(true);
+      }
       setEntryIds(d.context.entryIds ?? []);
       setCurrentModelOverride(null);
       setError(null);
@@ -744,6 +768,71 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     result.source.close();
     throw new EventStreamConnectionError(result.status);
   }, [connectEvents]);
+
+  const syncBackgroundSession = useCallback(async (sid: string) => {
+    if (!backgroundPendingRef.current || sessionIdRef.current !== sid) return;
+    const since = sessionRevisionRef.current;
+    const query = new URLSearchParams({ wake: "1" });
+    if (since) query.set("since", JSON.stringify(since));
+    try {
+      const res = await fetch(`/api/agent/${encodeURIComponent(sid)}/sync?${query.toString()}`);
+      if (!res.ok) return;
+      const result = await res.json() as {
+        changed?: boolean;
+        revision?: SessionRevision;
+      };
+      if (result.revision) sessionRevisionRef.current = result.revision;
+      if (result.changed) {
+        await loadSession(sid);
+        // Reconnect only for realtime acceleration; loadSession is the source
+        // of truth and does not create a prompt.
+        try { await ensureEventsConnected(sid); } catch { /* next tick retries */ }
+      }
+    } catch {
+      // Offline/browser sleep is expected; visibility/online/timer retries.
+    }
+  }, [ensureEventsConnected, loadSession]);
+
+  useEffect(() => {
+    backgroundPendingRef.current = backgroundPending;
+    if (!backgroundPending) {
+      if (backgroundSyncTimerRef.current) clearTimeout(backgroundSyncTimerRef.current);
+      backgroundSyncTimerRef.current = null;
+      return;
+    }
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    let disposed = false;
+    const tick = async () => {
+      if (disposed || !backgroundPendingRef.current || sessionIdRef.current !== sid) return;
+      await syncBackgroundSession(sid);
+      if (disposed || !backgroundPendingRef.current || sessionIdRef.current !== sid) return;
+      const delayMs = typeof document !== "undefined" && document.visibilityState === "hidden" ? 30_000 : 5_000;
+      backgroundSyncTimerRef.current = setTimeout(() => void tick(), delayMs);
+    };
+    void tick();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        if (backgroundSyncTimerRef.current) clearTimeout(backgroundSyncTimerRef.current);
+        backgroundSyncTimerRef.current = null;
+        void tick();
+      }
+    };
+    const onOnline = () => {
+      if (backgroundSyncTimerRef.current) clearTimeout(backgroundSyncTimerRef.current);
+      backgroundSyncTimerRef.current = null;
+      void tick();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("online", onOnline);
+    return () => {
+      disposed = true;
+      if (backgroundSyncTimerRef.current) clearTimeout(backgroundSyncTimerRef.current);
+      backgroundSyncTimerRef.current = null;
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("online", onOnline);
+    };
+  }, [backgroundPending, syncBackgroundSession]);
 
   const respondToExtensionUi = useCallback(async (
     request: ExtensionUiDialogRequest,
@@ -1057,6 +1146,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const handleAgentEvent = useCallback((event: AgentEvent) => {
     switch (event.type) {
+      case "custom_message": {
+        const customType = String(event.customType ?? (event.message as { customType?: unknown } | undefined)?.customType ?? "");
+        if (customType === "node-bg-result") {
+          backgroundPendingRef.current = false;
+          setBackgroundPending(false);
+          const sid = sessionIdRef.current;
+          if (sid) void loadSession(sid);
+        }
+        break;
+      }
       case "agent_start":
         cancelEventStreamGrace();
         sdkAgentActiveRef.current = true;
@@ -1165,6 +1264,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // appending it again would duplicate it.
         if (!agentRunningRef.current) break;
         const completed = event.message as AgentMessage | undefined;
+        const completedDetails = (completed as AgentMessage & { details?: Record<string, unknown> } | undefined)?.details;
+        if (completed?.role === "toolResult" && (completedDetails?.backgrounded === true || completedDetails?.watcher === "gateway")) {
+          backgroundPendingRef.current = true;
+          setBackgroundPending(true);
+        }
+        const completedCustomType = (completed as AgentMessage & { customType?: string } | undefined)?.customType;
+        if (completedCustomType === "node-bg-result") {
+          backgroundPendingRef.current = false;
+          setBackgroundPending(false);
+        }
         if (completed && completed.role === "user") {
           // Delivered steering/follow-up messages surface here as user
           // messages. The run's initial prompt also emits one, but handleSend

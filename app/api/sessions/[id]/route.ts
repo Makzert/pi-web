@@ -135,7 +135,16 @@ export async function GET(
 
     const header = sm.getHeader();
     let modified = header?.timestamp ?? new Date().toISOString();
-    try { modified = statSync(filePath).mtime.toISOString(); } catch { /* use header timestamp */ }
+    let modifiedMs = Date.parse(modified);
+    let size = 0;
+    try {
+      const fileStat = statSync(filePath);
+      modified = fileStat.mtime.toISOString();
+      modifiedMs = fileStat.mtimeMs;
+      size = fileStat.size;
+    } catch { /* use header timestamp */ }
+    const entryList = entries as Array<{ id?: string }>;
+    const lastEntryId = entryList.length > 0 ? String(entryList[entryList.length - 1]?.id ?? "") || null : null;
     const parentSessionId = header?.parentSession
       ? await resolveSessionIdByPath(header.parentSession)
       : undefined;
@@ -164,6 +173,7 @@ export async function GET(
       leafId,
       tree,
       context,
+      revision: { lastEntryId, modifiedMs: Number.isFinite(modifiedMs) ? modifiedMs : 0, size },
     });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });

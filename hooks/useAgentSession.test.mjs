@@ -5,7 +5,7 @@ import test from "node:test";
 const source = await readFile(new URL("./useAgentSession.ts", import.meta.url), "utf8");
 const chatWindowSource = await readFile(new URL("../components/ChatWindow.tsx", import.meta.url), "utf8");
 
-test("keeps the session event stream open through the idle grace window", () => {
+test("keeps the session event stream open through the short idle grace window", () => {
   const finishSource = source.slice(
     source.indexOf("const finishPromptWithoutStream"),
     source.indexOf("const waitForPromptSettlement"),
@@ -35,7 +35,7 @@ test("keeps the session event stream open through the idle grace window", () => 
     source.indexOf("  const executeBash = useCallback"),
   );
 
-  assert.match(source, /const EVENT_STREAM_IDLE_GRACE_MS = 24 \* 60 \* 60 \* 1_000/);
+  assert.match(source, /const EVENT_STREAM_IDLE_GRACE_MS = 30_000/);
   assert.match(graceSource, /setTimeout\(\(\) => void checkServerIdle\(\), EVENT_STREAM_IDLE_GRACE_MS\)/);
   assert.match(graceSource, /fetch\(`\/api\/agent\/\$\{encodeURIComponent\(sid\)\}`\)/);
   assert.match(graceSource, /closeEvents\(\)/);
