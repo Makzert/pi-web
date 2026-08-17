@@ -68,6 +68,7 @@ interface VideoPreviewInfo {
 interface ImagePreviewInfo {
   src: string;
   label: string;
+  bytes?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -150,19 +151,65 @@ function imageSourceFromToolResult(result: ToolResultMessage | undefined): strin
   return null;
 }
 
+const IMAGE_EXTENSION_RE = /\.(png|jpe?g|webp|gif|bmp)$/i;
+
+function imagePreviewFromBlock(
+  block: AssistantContentBlock,
+  toolResults: Map<string, ToolResultMessage>,
+): ImagePreviewInfo | null {
+  if (block.type !== "toolCall" || !isVisualToolCallBlock(block)) return null;
+  const legacy = block as ToolCallContent & { name?: unknown };
+  const toolName = block.toolName || legacy.name || "";
+  if (toolName !== "node_image" && toolName !== "node_image_model" && toolName !== "node_image_user") return null;
+
+  const result = toolResults.get(block.toolCallId);
+  if (result?.isError) return null;
+
+  // User-facing previews carry the proxy URL in details (no model context).
+  if (result && isRecord(result.details)) {
+    const details = result.details;
+    if (details.mediaType === "image" && typeof details.mediaUrl === "string" && details.mediaUrl) {
+      return {
+        src: details.mediaUrl,
+        label: typeof details.label === "string" ? details.label : "Remote image",
+        bytes: typeof details.bytes === "number" ? details.bytes : undefined,
+      };
+    }
+  }
+
+  // Model-facing tools embed a base64 image block in the result content.
+  const src = imageSourceFromToolResult(result);
+  if (src) return { src, label: "Remote image" };
+
+  // Fallback: derive the proxy URL from the tool call arguments.
+  const input = isRecord(block.input) ? block.input : {};
+  const node = typeof input.node === "string" ? input.node : "";
+  const remotePath = typeof input.path === "string" ? input.path : "";
+  if (node && remotePath && IMAGE_EXTENSION_RE.test(remotePath)) {
+    return {
+      src: `/api/node-media?node=${encodeURIComponent(node)}&path=${encodeURIComponent(remotePath)}`,
+      label: remotePath,
+    };
+  }
+  return null;
+}
+
 function imagePreviewsFromBlocks(blocks: AssistantContentBlock[], toolResults: Map<string, ToolResultMessage>): ImagePreviewInfo[] {
   const previews: ImagePreviewInfo[] = [];
   const seen = new Set<string>();
   for (const block of blocks) {
-    if (block.type !== "toolCall") continue;
-    const legacy = block as ToolCallContent & { name?: unknown };
-    if (block.toolName !== "node_image" && legacy.name !== "node_image") continue;
-    const src = imageSourceFromToolResult(toolResults.get(block.toolCallId));
-    if (!src || seen.has(src)) continue;
-    seen.add(src);
-    previews.push({ src, label: "Remote image" });
+    const preview = imagePreviewFromBlock(block, toolResults);
+    if (!preview || seen.has(preview.src)) continue;
+    seen.add(preview.src);
+    previews.push(preview);
   }
   return previews;
+}
+
+function formatPreviewBytes(bytes?: number): string {
+  if (!Number.isFinite(bytes) || !bytes || bytes < 0) return "";
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function ImagePreviewList({ previews }: { previews: ImagePreviewInfo[] }) {
@@ -170,8 +217,15 @@ function ImagePreviewList({ previews }: { previews: ImagePreviewInfo[] }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
       {previews.map((preview) => (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img key={preview.src} src={preview.src} alt={preview.label} style={{ maxWidth: "100%", maxHeight: 640, borderRadius: 6, objectFit: "contain", border: "1px solid var(--border)" }} />
+        <div key={preview.src} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          <a href={preview.src} target="_blank" rel="noopener noreferrer" title={`${preview.label} — open in new tab`}>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={preview.src} alt={preview.label} style={{ maxWidth: "100%", maxHeight: 640, borderRadius: 6, objectFit: "contain", border: "1px solid var(--border)", cursor: "zoom-in", display: "block" }} />
+          </a>
+          {formatPreviewBytes(preview.bytes) && (
+            <span style={{ fontSize: 11, color: "var(--text-dim)" }}>{formatPreviewBytes(preview.bytes)}</span>
+          )}
+        </div>
       ))}
     </div>
   );

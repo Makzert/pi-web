@@ -27,9 +27,15 @@ export function isVisualToolCallBlock(block: AssistantContentBlock): boolean {
   if (block.type !== "toolCall") return false;
   const legacy = block as ToolCallContent & { name?: unknown };
   return block.toolName === "node_video"
+    || block.toolName === "node_video_model"
     || block.toolName === "node_image"
+    || block.toolName === "node_image_model"
+    || block.toolName === "node_image_user"
     || legacy.name === "node_video"
-    || legacy.name === "node_image";
+    || legacy.name === "node_video_model"
+    || legacy.name === "node_image"
+    || legacy.name === "node_image_model"
+    || legacy.name === "node_image_user";
 }
 
 export function isFinalAnswerBlock(block: AssistantContentBlock): boolean {

@@ -107,16 +107,25 @@ export function VideoPreview({ src, candidates, label = "Video preview", bytes, 
     setError(false);
     setLoading(true);
     try {
-      const nextSources = await refreshSources();
+      // Ticket refresh is best-effort: older node-agents lack /media/ticket,
+      // so fall back to the candidates we already have (the proxy URL works).
+      let nextSources: string[];
+      try {
+        nextSources = await refreshSources();
+      } catch {
+        nextSources = sourceList;
+      }
       const selected = await selectFastestSource(nextSources);
-      const chosen = selected ?? nextSources[0];
+      if (!selected) {
+        setError(true);
+        return;
+      }
+      const chosen = selected;
       const index = nextSources.indexOf(chosen);
       setSourceList(nextSources);
       setActiveIndex(index >= 0 ? index : 0);
       setActiveSrc(chosen);
       setRevealed(true);
-    } catch {
-      setError(true);
     } finally {
       setLoading(false);
     }

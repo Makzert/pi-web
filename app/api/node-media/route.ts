@@ -11,12 +11,18 @@ interface NodeConfig {
 
 type RemoteResponse = Record<string, unknown>;
 
-const VIDEO_MIME_BY_EXTENSION: Record<string, string> = {
+const MEDIA_MIME_BY_EXTENSION: Record<string, string> = {
   ".mp4": "video/mp4",
   ".webm": "video/webm",
   ".mov": "video/quicktime",
   ".m4v": "video/x-m4v",
   ".ogv": "video/ogg",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+  ".bmp": "image/bmp",
 };
 const REMOTE_CHUNK_BYTES = 2 * 1024 * 1024;
 const REMOTE_TIMEOUT_MS = 120_000;
@@ -71,10 +77,10 @@ function mimeTypeForPath(filePath: string): string {
   const slash = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
   const dot = filePath.lastIndexOf(".");
   const extension = dot > slash ? filePath.slice(dot).toLowerCase() : "";
-  return VIDEO_MIME_BY_EXTENSION[extension] ?? "application/octet-stream";
+  return MEDIA_MIME_BY_EXTENSION[extension] ?? "application/octet-stream";
 }
 
-function isSupportedVideoPath(filePath: string): boolean {
+function isSupportedMediaPath(filePath: string): boolean {
   return mimeTypeForPath(filePath) !== "application/octet-stream";
 }
 
@@ -114,7 +120,7 @@ function parseRange(value: string | null, total: number): ByteRange | null {
 
 function contentDisposition(filePath: string): string {
   const slash = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
-  const fileName = filePath.slice(slash + 1).replace(/[\"\\\r\n]/g, "_") || "video";
+  const fileName = filePath.slice(slash + 1).replace(/[\"\\\r\n]/g, "_") || "media";
   return `inline; filename="${fileName}"`;
 }
 
@@ -138,27 +144,28 @@ export async function POST(request: NextRequest) {
   if (!node || !remotePath) {
     return NextResponse.json({ error: "Unknown node or missing path" }, { status: 400 });
   }
-  if (!isSupportedVideoPath(remotePath)) {
-    return NextResponse.json({ error: "Unsupported video format" }, { status: 415 });
+  if (!isSupportedMediaPath(remotePath)) {
+    return NextResponse.json({ error: "Unsupported media format" }, { status: 415 });
   }
 
+  const proxyMediaUrl = `/api/node-media?node=${encodeURIComponent(nodeName)}&path=${encodeURIComponent(remotePath)}`;
+  let ticketResult: RemoteResponse = {};
   try {
-    const ticketResult = await callNode(node, "/media/ticket", { path: remotePath });
-    const proxyMediaUrl = `/api/node-media?node=${encodeURIComponent(nodeName)}&path=${encodeURIComponent(remotePath)}`;
-    const mediaCandidates = [...new Set([...directMediaUrls(ticketResult), proxyMediaUrl])];
-    if (mediaCandidates.length === 1 && mediaCandidates[0] === proxyMediaUrl) {
-      return NextResponse.json({ error: "Remote node returned no media ticket" }, { status: 502 });
-    }
-    return NextResponse.json({
-      mediaUrl: mediaCandidates[0],
-      mediaCandidates,
-      proxyMediaUrl,
-    }, {
-      headers: { "Cache-Control": "no-store" },
-    });
-  } catch (error) {
-    return NextResponse.json({ error: error instanceof Error ? error.message : String(error) }, { status: 502 });
+    ticketResult = await callNode(node, "/media/ticket", { path: remotePath });
+  } catch {
+    // The node-agent may not implement /media/ticket (older versions). The
+    // same-origin proxy below streams via /transfer/download and needs no
+    // ticket, so degrade gracefully to the proxy instead of failing the play.
+    ticketResult = {};
   }
+  const mediaCandidates = [...new Set([...directMediaUrls(ticketResult), proxyMediaUrl])];
+  return NextResponse.json({
+    mediaUrl: mediaCandidates[0],
+    mediaCandidates,
+    proxyMediaUrl,
+  }, {
+    headers: { "Cache-Control": "no-store" },
+  });
 }
 
 export async function GET(request: NextRequest) {
@@ -172,8 +179,8 @@ export async function GET(request: NextRequest) {
   if (!node || !remotePath) {
     return NextResponse.json({ error: "Unknown node or missing path" }, { status: 400 });
   }
-  if (!isSupportedVideoPath(remotePath)) {
-    return NextResponse.json({ error: "Unsupported video format" }, { status: 415 });
+  if (!isSupportedMediaPath(remotePath)) {
+    return NextResponse.json({ error: "Unsupported media format" }, { status: 415 });
   }
 
   let downloadId = "";

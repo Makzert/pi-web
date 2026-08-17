@@ -768,6 +768,81 @@ function ImageToolResult({ result }: { result?: ToolResultMessage }) {
   );
 }
 
+interface ImagePreviewResult {
+  mediaUrl: string;
+  mediaCandidates?: string[];
+  label: string;
+  bytes?: number;
+  refresh?: { node: string; path: string };
+}
+
+const IMAGE_EXTENSION_RE = /\.(png|jpe?g|webp|gif|bmp)$/i;
+
+function getImagePreviewResult(result: ToolResultMessage | undefined): ImagePreviewResult | null {
+  const details = result?.details;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return null;
+  const record = details as Record<string, unknown>;
+  if (result?.isError || record.mediaType !== "image" || typeof record.mediaUrl !== "string" || !record.mediaUrl) return null;
+  const mediaCandidates = Array.isArray(record.mediaCandidates)
+    ? record.mediaCandidates.filter((candidate): candidate is string => typeof candidate === "string" && candidate.length > 0)
+    : undefined;
+  return {
+    mediaUrl: record.mediaUrl,
+    mediaCandidates: mediaCandidates?.length ? mediaCandidates : undefined,
+    label: typeof record.label === "string" ? record.label : "Remote image",
+    bytes: typeof record.bytes === "number" ? record.bytes : undefined,
+    refresh: typeof record.node === "string" && typeof record.path === "string"
+      ? { node: record.node, path: record.path }
+      : undefined,
+  };
+}
+
+function getImagePreviewFromToolCall(block: ToolCallContent): ImagePreviewResult | null {
+  const legacy = block as ToolCallContent & { name?: unknown; arguments?: unknown };
+  const input = block.input && typeof block.input === "object"
+    ? block.input
+    : (legacy.arguments && typeof legacy.arguments === "object" && !Array.isArray(legacy.arguments)
+      ? legacy.arguments as Record<string, unknown>
+      : {});
+  const node = typeof input.node === "string" ? input.node : "";
+  const remotePath = typeof input.path === "string" ? input.path : "";
+  if (!node || !remotePath || !IMAGE_EXTENSION_RE.test(remotePath)) return null;
+  return {
+    mediaUrl: `/api/node-media?node=${encodeURIComponent(node)}&path=${encodeURIComponent(remotePath)}`,
+    label: remotePath,
+    refresh: { node, path: remotePath },
+  };
+}
+
+function ImagePreviewToolResult({ block, result }: { block: ToolCallContent; result?: ToolResultMessage }) {
+  const image = getImagePreviewResult(result) ?? getImagePreviewFromToolCall(block);
+  if (!image) return null;
+  const sizeLabel = image.bytes !== undefined && Number.isFinite(image.bytes)
+    ? image.bytes >= 1048576 ? `${(image.bytes / 1048576).toFixed(1)} MB` : `${Math.round(image.bytes / 1024)} KB`
+    : "";
+  return (
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+      <a
+        href={image.mediaUrl}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={`${image.label}${sizeLabel ? ` (${sizeLabel})` : ""} — open in new tab`}
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={image.mediaUrl}
+          alt={image.label}
+          loading="lazy"
+          style={{ maxWidth: "100%", maxHeight: 480, borderRadius: 8, objectFit: "contain", border: "1px solid var(--border)", cursor: "zoom-in", display: "block" }}
+        />
+      </a>
+      {sizeLabel && (
+        <span style={{ fontSize: 11, color: "var(--text-dim)", alignSelf: "center" }}>{sizeLabel}</span>
+      )}
+    </div>
+  );
+}
+
 function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCallDurations, cwd, onOpenFile, sessionId, entryId, blockIndex }: { block: AssistantContentBlock; toolResults?: Map<string, ToolResultMessage>; isStreaming?: boolean; streamingDuration?: number; toolCallDurations?: Map<string, number>; cwd?: string; onOpenFile?: (filePath: string) => void; sessionId?: string; entryId?: string; blockIndex: number }) {
   if (block.type === "text") {
     return <TextBlock block={block as TextContent} isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile} />;
@@ -780,11 +855,24 @@ function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCal
     const result = toolResults?.get(tc.toolCallId);
     const duration = toolCallDurations?.get(tc.toolCallId);
     if (isVisualToolCallBlock(tc)) {
-      return result?.isError
-        ? <ToolCallBlock block={tc} result={result} duration={duration} />
-        : (tc.toolName === "node_image" || (tc as ToolCallContent & { name?: unknown }).name === "node_image")
-          ? <ImageToolResult result={result} />
-          : <VideoToolResult block={tc} result={result} />;
+      if (result?.isError) {
+        return <ToolCallBlock block={tc} result={result} duration={duration} />;
+      }
+      const legacyName = (tc as ToolCallContent & { name?: unknown }).name;
+      // node_image / node_image_user: user-facing inline preview (mediaUrl in details).
+      if (tc.toolName === "node_image" || legacyName === "node_image"
+        || tc.toolName === "node_image_user" || legacyName === "node_image_user") {
+        return <ImagePreviewToolResult block={tc} result={result} />;
+      }
+      // node_image_model: image blocks in the result are the model's attachment.
+      if (tc.toolName === "node_image_model" || legacyName === "node_image_model") {
+        return <ImageToolResult result={result} />;
+      }
+      if (tc.toolName === "node_video" || legacyName === "node_video") {
+        return <VideoToolResult block={tc} result={result} />;
+      }
+      // node_video_model: metadata-only for the model; no user-facing player.
+      return <ToolCallBlock block={tc} result={result} duration={duration} />;
     }
     return <ToolCallBlock block={tc} result={result} duration={duration} />;
   }
