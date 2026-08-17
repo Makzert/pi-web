@@ -2,7 +2,7 @@
 
 Ultron 的前端定制以本仓库源码为唯一事实来源，不以全局 npm 包或手工复制的 `.next` 为来源。
 
-当前 launchd 服务 `com.pi.web` 通过 `/Users/Admin/.pi/agent/start-pi-web.sh` 直接启动本仓库的生产构建：
+当前 launchd 服务 `com.pi.web` 通过本仓库的 `scripts/start-ultron-pi-web.sh` 直接启动生产构建；`/Users/Admin/.pi/agent/start-pi-web.sh` 只保留密码、代理等机器配置：
 
 ```text
 /Users/Admin/.zcode/workspace/default/ultron/pi-web
