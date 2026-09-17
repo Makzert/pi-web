@@ -1,10 +1,10 @@
 "use client";
 import { registerAbortHandler } from "@/hooks/useKeyboardShortcuts";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, CustomMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage, ToolCallContent, UserMessage } from "@/lib/types";
+import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage, ToolCallContent, UserMessage } from "@/lib/types";
 import { normalizeCustomPanelLines, parseAnsiLine } from "@/lib/ansi";
 import { asBracketedPaste, toTerminalKeyData } from "@/lib/terminal-input";
-import { countToolCallBlocks, getAssistantErrorMessage, getDisplayableAssistantBlocks, isVisualToolCallBlock, splitFinalAssistantBlocks } from "@/lib/message-display";
+import { countToolCallBlocks, findLegacyGroupEnd, getAssistantErrorMessage, getDisplayableAssistantBlocks, getPhasedAssistantParts, hasAssistantPhase, isGroupAnchor, isVisualToolCallBlock, splitFinalAssistantBlocks } from "@/lib/message-display";
 import { MessageView } from "./MessageView";
 import { VideoPreview } from "./VideoPreview";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
@@ -279,19 +279,6 @@ function hasDisplayableProcessMessage(message: AgentMessage): boolean {
     return getDisplayableAssistantBlocks(message as AssistantMessage).length > 0;
   }
   return message.role === "custom";
-}
-
-// A user message normally anchors a turn (user prompt → process → final
-// answer), and the process messages in between get folded into a collapsed
-// ProcessDetailsGroup. When compaction fires mid-turn, pi drops the original
-// user prompt and inserts a compaction summary (role "custom", customType
-// "compaction") in its place; the agent then keeps producing tool calls and a
-// final answer with no user message left to anchor them. Treat a compaction
-// summary as an anchor too, otherwise every post-compaction message renders
-// standalone and never collapses.
-function isGroupAnchor(message: AgentMessage): boolean {
-  if (message.role === "user") return true;
-  return message.role === "custom" && (message as CustomMessage).customType === "compaction";
 }
 
 function withAssistantBlocks(
@@ -894,6 +881,42 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
               const rendered: ReactNode[] = [];
               for (let idx = 0; idx < messages.length;) {
                 const msg = messages[idx];
+                if (hasAssistantPhase(msg)) {
+                  const parts = getPhasedAssistantParts(msg);
+                  const firstAnswer = parts.findIndex((part) => part.kind === "answer");
+                  const refPart = firstAnswer < 0 ? 0 : firstAnswer;
+                  parts.forEach((part, partIdx) => {
+                    const isLast = partIdx === parts.length - 1;
+                    // Keep file block indices for deferred thinking lookups.
+                    // MessageView filters these empty thinking placeholders.
+                    const blocks = msg.content.map((block): AssistantContentBlock => part.blocks.includes(block)
+                      ? block : { type: "thinking", thinking: "" });
+                    const message = withAssistantBlocks(msg, blocks, { omitUsage: !isLast });
+                    if (!isLast) {
+                      message.stopReason = undefined;
+                      message.errorMessage = undefined;
+                    }
+                    const content = renderMessage(idx, {
+                      attachRef: false,
+                      keyPrefix: `phase-${partIdx}`,
+                      messageOverride: message,
+                      showTimestamp: isLast && part.kind === "answer",
+                    });
+                    const refIndex = visibleRefIndexByMessage.get(idx);
+                    rendered.push(
+                      <div key={`phase-${entryIds[idx] ?? idx}-${partIdx}`}
+                        ref={partIdx === refPart && refIndex !== undefined ? attachVisibleRef(idx, refIndex) : undefined}>
+                        {part.kind === "answer" ? content : (
+                          <ProcessDetailsGroup messageCount={1} toolCallCount={countToolCallBlocks(part.blocks)} t={t}>
+                            {content}
+                          </ProcessDetailsGroup>
+                        )}
+                      </div>,
+                    );
+                  });
+                  idx += 1;
+                  continue;
+                }
                 if (!isGroupAnchor(msg)) {
                   rendered.push(renderMessage(idx));
                   idx += 1;
@@ -901,8 +924,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                 }
 
                 const userIdx = idx;
-                let endIdx = userIdx + 1;
-                while (endIdx < messages.length && !isGroupAnchor(messages[endIdx])) endIdx += 1;
+                const endIdx = findLegacyGroupEnd(messages, userIdx);
 
                 const finalAssistantIdx = findFinalAssistantIndex(messages, userIdx, endIdx);
 

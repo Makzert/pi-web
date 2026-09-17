@@ -19,6 +19,7 @@ export interface SessionEntryBase {
 export interface TextContent {
   type: "text";
   text: string;
+  textSignature?: string;
 }
 
 export interface ImageContent {
