@@ -1,5 +1,15 @@
 # Ultron Pi Web 本地定制持久化
 
+## 固定 SDK 的版本化发布
+
+包含 `session_wait` 的 Ultron 实例需要锁定的 Pi SDK 0.84.2 及宿主补丁，不能直接用上游 npm 包替换。发布在独立目录构建，不对开发 checkout 的 `.next` 执行生产构建。验证后，由 `~/.local/share/ultron/current` 指向选定发布；`start-pi-web.sh` 显式从该目录运行，并通过 `PI_WEB_PACKAGE_DIR` 让原品牌重放层作用于该发布。
+
+原全局 npm 安装保留，不覆盖认证、模型、节点配置或会话目录。发布记录、启动脚本备份、旧运行包快照及自包含回滚工具放在 `~/.local/share/ultron/deployments/<timestamp>/`，目录仅当前用户可访问。回滚使用该目录的 `cutover.py --rollback`，只恢复启动配置及运行版本，不回滚 Git 源码或用户会话。
+
+处于此发布模式时，旧 `update.sh` 会明确拒绝“只更新上游 npm 包”，避免误报运行版本已更新或丢失 SDK 补丁。后续更新应重新构建、验证、切换发布指针，再重启 `com.pi.web`。`ensure-customized.sh` 与原 Logo 来源仍保留。
+
+## 上游全局包模式（历史启动／回滚路径）
+
 Ultron 的品牌和前端产物定制是**安装后重放层**，唯一事实来源是：
 
 ```text
