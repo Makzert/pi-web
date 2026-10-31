@@ -134,14 +134,20 @@ export interface AgentSessionLike {
   readonly resourceLoader: ResourceLoaderLike;
 
   readonly bindExtensions?: unknown;
+  getSessionWaitState?(): { waitId: string; startedAt: number; deadlineAt: number } | null;
   dispose(): void;
   reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void>;
   subscribe(listener: (event: AgentSessionEvent) => void): () => void;
   prompt(text: string, options?: {
+    operationId?: string;
+    timestamp?: number;
     images?: Array<{ type: "image"; data: string; mimeType: string }>;
     streamingBehavior?: "steer" | "followUp";
     source?: "interactive" | "rpc";
+    preflightResult?: (accepted: boolean) => void;
+    acceptedResult?: (accepted: boolean) => void;
   }): Promise<void>;
+  resumePendingQueueTake(): Promise<boolean>;
   abort(): Promise<void>;
   executeBash(command: string, onChunk?: (chunk: string) => void, options?: { excludeFromContext?: boolean }): Promise<{ output: string; exitCode?: number; cancelled?: boolean; truncated?: boolean; fullOutputPath?: string }>;
   abortBash(): void;
@@ -155,12 +161,13 @@ export interface AgentSessionLike {
   getLastAssistantText(): string | undefined;
   setAutoCompactionEnabled(enabled: boolean): void;
   setAutoRetryEnabled(enabled: boolean): void;
-  steer(text: string, images?: Array<{ type: "image"; data: string; mimeType: string }>): Promise<void>;
-  followUp(text: string, images?: Array<{ type: "image"; data: string; mimeType: string }>): Promise<void>;
+  steer(text: string, images?: Array<{ type: "image"; data: string; mimeType: string }>, options?: { operationId?: string; timestamp?: number }): Promise<void>;
+  followUp(text: string, images?: Array<{ type: "image"; data: string; mimeType: string }>, options?: { operationId?: string; timestamp?: number }): Promise<void>;
   readonly pendingMessageCount: number;
   getSteeringMessages(): readonly string[];
   getFollowUpMessages(): readonly string[];
   clearQueue(): { steering: string[]; followUp: string[] };
+  clearQueueCommitted(operationId?: string): Promise<{ steering: string[]; followUp: string[] }>;
   getAllTools(): ToolInfo[];
   getActiveToolNames(): string[];
   setActiveToolsByName(names: string[]): void;

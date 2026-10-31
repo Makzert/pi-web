@@ -127,3 +127,19 @@ test("sizes the message tail from the rendered bottom composer", () => {
   assert.match(chatWindowSource, /<div ref=\{bottomComposerRef\} className="relative">/);
   assert.match(chatWindowSource, /height: bottomComposerHeight/);
 });
+
+test("session waiting stays active and stale wait-end events cannot overwrite a replacement wait", () => {
+  const waitSource = source.slice(source.indexOf('case "session_wait_start"'), source.indexOf('case "tool_execution_start"'));
+  assert.match(waitSource, /if \(!agentRunningRef\.current\) break/);
+  assert.match(waitSource, /kind: "waiting_event"/);
+  assert.match(waitSource, /phase\.waitId === event\.waitId/);
+  assert.doesNotMatch(waitSource, /onAgentEnd|setAgentRunning\(false\)|dispatch\(\{ type: "end"/);
+  assert.match(chatWindowSource, /phase\?\.kind === "waiting_event"/);
+  assert.match(chatWindowSource, /chat\.waitingEvent/);
+});
+
+test("refresh and reconciliation restore the server wait state instead of showing model thinking", () => {
+  assert.match(source, /if \(liveState\.sessionWait\) setAgentPhase\(\{ kind: "waiting_event", \.\.\.liveState\.sessionWait \}\)/);
+  assert.match(source, /if \(state\?\.sessionWait\) setAgentPhase/);
+  assert.match(source, /setAgentPhase\(agentState\.state\.sessionWait \? \{ kind: "waiting_event"/);
+});

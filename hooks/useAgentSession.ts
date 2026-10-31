@@ -12,6 +12,7 @@ import type {
 import { normalizeToolCalls } from "@/lib/normalize";
 import { sendAgentCommand } from "@/lib/agent-client";
 import { getToolNamesForPreset, type ToolEntry } from "@/lib/tool-presets";
+import { streamReducer } from "@/lib/stream-state";
 import type { SessionStatsInfo } from "@/lib/pi-types";
 
 export interface SessionData {
@@ -34,31 +35,6 @@ interface SessionRevision {
   size: number;
 }
 
-interface StreamingState {
-  isStreaming: boolean;
-  streamingMessage: Partial<AgentMessage> | null;
-}
-
-type StreamAction =
-  | { type: "start" }
-  | { type: "update"; message: Partial<AgentMessage> }
-  | { type: "end" }
-  | { type: "reset" };
-
-function streamReducer(state: StreamingState, action: StreamAction): StreamingState {
-  switch (action.type) {
-    case "start":
-      return { isStreaming: true, streamingMessage: null };
-    case "update":
-      return { isStreaming: true, streamingMessage: action.message };
-    case "end":
-    case "reset":
-      return { isStreaming: false, streamingMessage: null };
-    default:
-      return state;
-  }
-}
-
 interface AgentEvent {
   type: string;
   [key: string]: unknown;
@@ -79,6 +55,7 @@ type AgentStateResponse = {
   thinkingLevel?: string;
   isStreaming?: boolean;
   isPromptRunning?: boolean;
+  sessionWait?: { waitId: string; startedAt: number; deadlineAt: number } | null;
   isBashRunning?: boolean;
   isCompacting?: boolean;
   extensionStatuses?: ExtensionStatusItem[];
@@ -118,6 +95,7 @@ type NoticeAction =
 
 export type AgentPhase =
   | { kind: "waiting_model" }
+  | { kind: "waiting_event"; waitId: string; startedAt: number; deadlineAt: number }
   | { kind: "running_command" }
   | { kind: "running_tools"; tools: { id: string; name: string }[] }
   | null;
@@ -427,6 +405,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const backgroundPendingRef = useRef(false);
   const backgroundSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionRevisionRef = useRef<SessionRevision | null>(null);
+  const pendingQueueInputsRef = useRef(new Map<string, { operationId: string; timestamp: number }>());
+  const pendingRecallOperationRef = useRef<{ sessionId: string; operationId: string; timestamp: number } | null>(null);
 
   const setToolPresetState = opts.setToolPreset ?? setToolPreset;
 
@@ -552,6 +532,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (liveState.extensionStatuses !== undefined) setExtensionStatuses(liveState.extensionStatuses ?? []);
           if (liveState.extensionWidgets !== undefined) setExtensionWidgets(liveState.extensionWidgets ?? []);
           if (liveState.queuedMessages !== undefined) setQueuedMessages(normalizeQueuedMessages(liveState.queuedMessages));
+          if (liveState.sessionWait) setAgentPhase({ kind: "waiting_event", ...liveState.sessionWait });
         } else if (!agentState.running) {
           setQueuedMessages({ steering: [], followUp: [] });
         }
@@ -1113,6 +1094,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // (wrapper destroyed) means nothing is compacting.
       setIsCompacting(state?.isCompacting ?? false);
       setQueuedMessages(normalizeQueuedMessages(state?.queuedMessages));
+      if (state?.sessionWait) setAgentPhase({ kind: "waiting_event", ...state.sessionWait });
       const busy = data.running && state
         && (state.isStreaming || state.isPromptRunning || state.isCompacting);
       if (busy || !agentRunningRef.current) return;
@@ -1315,6 +1297,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
         dispatch({ type: "reset" });
         setAgentPhase({ kind: "waiting_model" });
+        break;
+      }
+      case "session_wait_start": {
+        if (!agentRunningRef.current) break;
+        setAgentPhase({ kind: "waiting_event", waitId: String(event.waitId), startedAt: Number(event.startedAt), deadlineAt: Number(event.deadlineAt) });
+        break;
+      }
+      case "session_wait_end": {
+        setAgentPhase((phase) => phase?.kind === "waiting_event" && phase.waitId === event.waitId ? { kind: "waiting_model" } : phase);
         break;
       }
       case "tool_execution_start": {
@@ -1735,13 +1726,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const sid = sessionIdRef.current;
     if (!sid) return;
     const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
+    const key = JSON.stringify([sid, "steer", message, piImages]);
+    const operation = pendingQueueInputsRef.current.get(key) ?? { operationId: crypto.randomUUID(), timestamp: Date.now() };
     try {
       await sendAgentCommand(sid, {
         type: "steer",
+        ...operation,
         message,
         ...(piImages?.length ? { images: piImages } : {}),
       });
+      pendingQueueInputsRef.current.delete(key);
     } catch (e) {
+      pendingQueueInputsRef.current.set(key, operation);
       console.error("Failed to steer:", e);
     }
   }, []);
@@ -1754,14 +1750,19 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const sid = sessionIdRef.current;
     if (!sid) return;
     const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
+    const key = JSON.stringify([sid, "prompt", behavior, message, piImages]);
+    const operation = pendingQueueInputsRef.current.get(key) ?? { operationId: crypto.randomUUID(), timestamp: Date.now() };
     try {
       await sendAgentCommand(sid, {
         type: "prompt",
+        ...operation,
         message,
         streamingBehavior: behavior,
         ...(piImages?.length ? { images: piImages } : {}),
       });
+      pendingQueueInputsRef.current.delete(key);
     } catch (e) {
+      pendingQueueInputsRef.current.set(key, operation);
       console.error("Failed to queue prompt:", e);
     }
   }, []);
@@ -1770,13 +1771,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const sid = sessionIdRef.current;
     if (!sid) return;
     const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
+    const key = JSON.stringify([sid, "followUp", message, piImages]);
+    const operation = pendingQueueInputsRef.current.get(key) ?? { operationId: crypto.randomUUID(), timestamp: Date.now() };
     try {
       await sendAgentCommand(sid, {
         type: "follow_up",
+        ...operation,
         message,
         ...(piImages?.length ? { images: piImages } : {}),
       });
+      pendingQueueInputsRef.current.delete(key);
     } catch (e) {
+      pendingQueueInputsRef.current.set(key, operation);
       console.error("Failed to follow up:", e);
     }
   }, []);
@@ -1794,8 +1800,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleRecallQueue = useCallback(async () => {
     const sid = sessionIdRef.current;
     if (!sid) return;
+    const pending = pendingRecallOperationRef.current;
+    const operation = pending?.sessionId === sid ? pending
+      : { sessionId: sid, operationId: crypto.randomUUID(), timestamp: Date.now() };
+    pendingRecallOperationRef.current = operation;
     try {
-      const result = await sendAgentCommand<{ steering?: string[]; followUp?: string[] }>(sid, { type: "clear_queue" });
+      const result = await sendAgentCommand<{ steering?: string[]; followUp?: string[] }>(sid,
+        { type: "clear_queue", operationId: operation.operationId, timestamp: operation.timestamp });
+      pendingRecallOperationRef.current = null;
       // clearQueue also emits an empty queue_update, but that only reaches us
       // while SSE is connected — clear locally so idle recalls update the UI.
       setQueuedMessages({ steering: [], followUp: [] });
@@ -1891,7 +1903,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             rpcPromptPendingRef.current = Boolean(agentState.state.isPromptRunning);
             agentRunningRef.current = true;
             setAgentRunning(true);
-            setAgentPhase(agentState.state.isStreaming ? { kind: "waiting_model" } : { kind: "running_command" });
+            setAgentPhase(agentState.state.sessionWait ? { kind: "waiting_event", ...agentState.state.sessionWait }
+              : agentState.state.isStreaming ? { kind: "waiting_model" } : { kind: "running_command" });
             dispatch({ type: "start" });
             void connectEvents(session.id);
             if (!agentState.state.isStreaming && agentState.state.isPromptRunning) {

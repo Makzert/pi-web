@@ -48,6 +48,7 @@ function phaseLabel(phase: AgentPhase, t: (key: string, params?: Record<string, 
     if (names.length <= 3) return t("chat.runningTools", { names: names.join(", ") });
     return t("chat.runningToolsMore", { names: names.slice(0, 2).join(", "), count: names.length - 2 });
   }
+  if (phase?.kind === "waiting_event") return t("chat.waitingEvent", { until: new Date(phase.deadlineAt).toLocaleTimeString() });
   if (phase?.kind === "waiting_model") return t("chat.waitingModel");
   if (phase?.kind === "running_command") return t("chat.runningCommand");
   return null;

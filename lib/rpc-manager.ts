@@ -10,6 +10,7 @@ import { resolveVisibleModels, selectInitialModelScope } from "./model-scope";
 import { cacheSessionPath, invalidateSessionListCache } from "./session-reader";
 import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
 import { persistExplicitStartupPreferences } from "./startup-preferences";
+import { waitForQueuedPromptAdmission } from "./prompt-admission";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
 import type { ExtensionUiRequest, ExtensionUiResponse, ExtensionWidgetItem } from "./types";
@@ -142,6 +143,9 @@ export class AgentSessionWrapper {
   private extensionStatuses = new Map<string, string>();
   private extensionWidgets = new Map<string, ExtensionWidgetItem>();
   private promptRunning = false;
+  private promptOperations = new Map<string, { fingerprint: string; admission: Promise<boolean> }>();
+  private promptPreflight: Promise<boolean> | null = null;
+  private promptAdmissionTail: Promise<unknown> = Promise.resolve();
   private extensionsBound = false;
   private extensionBindingPromise: Promise<void> | null = null;
   private extensionBindingError: unknown = null;
@@ -268,7 +272,7 @@ export class AgentSessionWrapper {
   }
 
   private shouldWaitForExtensions(type: string): boolean {
-    return type === "prompt" || type === "steer" || type === "follow_up" || type === "get_commands";
+    return type === "prompt" || type === "steer" || type === "follow_up" || type === "clear_queue" || type === "resume_queue" || type === "get_commands";
   }
 
   private async withFinalRunningNotification<T>(operation: () => Promise<T>): Promise<T> {
@@ -350,38 +354,131 @@ export class AgentSessionWrapper {
       if (imageError) throw new Error(imageError);
     }
 
+    // Reserve admission before prompt preflight can yield. Only acceptance is
+    // serialized, never the full Agent run; queued inputs and abort stay usable.
+    if (type === "prompt") {
+      const knownOperation = typeof command.operationId === "string" && this.promptOperations.has(command.operationId);
+      if (this.promptRunning && !command.streamingBehavior && !knownOperation) {
+        throw new Error("A prompt is already running; choose steer or follow-up to queue another input");
+      }
+      // Capture a pending input/command handler before waiting for admission.
+      // If it handles input without starting an Agent, a queued request must
+      // not silently become a new /direct turn once that handler returns.
+      const pendingPreflight = !knownOperation && command.streamingBehavior && this.promptRunning && !this.inner.isStreaming
+        ? this.promptPreflight : null;
+      const admission = this.promptAdmissionTail.then(async () => {
+        if (pendingPreflight) await waitForQueuedPromptAdmission(true, () => this.inner.isStreaming, pendingPreflight);
+        return this.sendCommand(command);
+      });
+      this.promptAdmissionTail = admission.catch(() => undefined);
+      return admission;
+    }
+    return this.sendCommand(command);
+  }
+
+  private async sendCommand(command: Record<string, unknown>): Promise<unknown> {
+    if (!this._alive) throw new Error("Session has been destroyed");
+    const type = command.type as string;
     switch (type) {
       case "prompt": {
+        const operationId = command.operationId as string | undefined;
+        const admissionFingerprint = JSON.stringify([command.message, command.images, command.streamingBehavior, command.timestamp]);
+        const priorPrompt = operationId ? this.promptOperations.get(operationId) : undefined;
+        if (priorPrompt) {
+          if (priorPrompt.fingerprint !== admissionFingerprint) throw new Error("prompt operation ID reused for different input");
+          if (!await priorPrompt.admission) throw new Error("prompt was not accepted");
+          return null;
+        }
         if (this.inner.isBashRunning) {
           throw new Error("Cannot send a prompt while a shell command is running");
         }
-        // Fire and forget — events come via subscribe
+        // Active runs queue input through Pi's awaited stage gate. New runs
+        // continue asynchronously; their progress arrives through subscribe.
         const promptImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
         const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
+        if (this.promptRunning && !streamingBehavior) {
+          throw new Error("A prompt is already running; choose steer or follow-up to queue another input");
+        }
+        if (streamingBehavior && await waitForQueuedPromptAdmission(
+          this.promptRunning, () => this.inner.isStreaming, this.promptPreflight,
+        )) {
+          // Queued input is accepted only after Pi's stage gate confirms it.
+          const concurrentPrompt = operationId ? this.promptOperations.get(operationId) : undefined;
+          if (concurrentPrompt) {
+            if (concurrentPrompt.fingerprint !== admissionFingerprint) throw new Error("prompt operation ID reused for different input");
+            if (!await concurrentPrompt.admission) throw new Error("prompt was not accepted");
+            return null;
+          }
+          const admission = this.inner.prompt(command.message as string, {
+            ...(promptImages?.length ? { images: promptImages } : {}),
+            streamingBehavior,
+            source: "rpc",
+            operationId,
+            timestamp: command.timestamp as number | undefined,
+          });
+          if (operationId) this.promptOperations.set(operationId, { fingerprint: admissionFingerprint, admission: admission.then(() => true, () => false) });
+          try {
+            await admission;
+          } catch (error) {
+            if (operationId) this.promptOperations.delete(operationId);
+            throw error;
+          }
+          return null;
+        }
+        let resolvePreflight!: (accepted: boolean) => void;
+        this.promptPreflight = new Promise<boolean>((resolve) => { resolvePreflight = resolve; });
+        let preflightSettled = false;
+        const settlePreflight = (accepted: boolean) => {
+          if (preflightSettled) return;
+          preflightSettled = true;
+          resolvePreflight(accepted);
+        };
         this.promptRunning = true;
+        let resolveAdmission!: (accepted: boolean) => void;
+        const admission = new Promise<boolean>((resolve) => { resolveAdmission = resolve; });
+        let directAccepted = false;
+        const settleAdmission = (accepted: boolean) => {
+          if (accepted) directAccepted = true;
+          resolveAdmission(accepted);
+        };
+        if (operationId) this.promptOperations.set(operationId, { fingerprint: admissionFingerprint, admission });
         notifyRunningChange();
         this.inner.prompt(command.message as string, {
           ...(promptImages?.length ? { images: promptImages } : {}),
           ...(streamingBehavior ? { streamingBehavior } : {}),
           source: "rpc",
+          preflightResult: settlePreflight,
+          acceptedResult: settleAdmission,
+          operationId: command.operationId as string | undefined,
+          timestamp: command.timestamp as number | undefined,
         }).then(() => {
+          settlePreflight(true);
           this.promptRunning = false;
+          this.promptPreflight = null;
           this.resetIdleTimer();
-          if (!streamingBehavior) this.emit({ type: "prompt_done" });
+          this.emit({ type: "prompt_done" });
           notifyRunningChange();
         }).catch((error) => {
+          settlePreflight(false);
+          settleAdmission(false);
+          if (!directAccepted && operationId) this.promptOperations.delete(operationId);
           this.promptRunning = false;
+          this.promptPreflight = null;
           this.resetIdleTimer();
           invalidateSessionListCache();
           this.emit({
             type: "prompt_error",
             errorMessage: error instanceof Error ? error.message : String(error),
           });
-          if (!streamingBehavior) this.emit({ type: "prompt_done" });
+          this.emit({ type: "prompt_done" });
           notifyRunningChange();
         });
+        if (!await admission) throw new Error("prompt was not accepted");
         return null;
       }
+
+      case "resume_queue":
+        return { resumed: await this.inner.resumePendingQueueTake() };
 
       case "abort":
         await this.withFinalRunningNotification(() => this.inner.abort());
@@ -395,6 +492,7 @@ export class AgentSessionWrapper {
           sessionFile: this.inner.sessionFile ?? "",
           isStreaming: this.inner.isStreaming,
           isPromptRunning: this.promptRunning,
+          sessionWait: this.inner.getSessionWaitState?.() ?? null,
           isBashRunning: this.inner.isBashRunning,
           isCompacting: this.inner.isCompacting,
           autoCompactionEnabled: this.inner.autoCompactionEnabled,
@@ -523,20 +621,21 @@ export class AgentSessionWrapper {
       }
 
       case "clear_queue": {
-        // Full clear only: pi has no single-item dequeue, and clear+requeue
-        // races against the agent loop pulling messages mid-flight.
-        return this.inner.clearQueue();
+        // Commit cancellation before changing Pi's queued user inputs.
+        return await this.inner.clearQueueCommitted(command.operationId as string | undefined);
       }
 
       case "steer": {
         const steerImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
-        await this.inner.steer(command.message as string, steerImages?.length ? steerImages : undefined);
+        await this.inner.steer(command.message as string, steerImages?.length ? steerImages : undefined,
+          { operationId: command.operationId as string | undefined, timestamp: command.timestamp as number | undefined });
         return null;
       }
 
       case "follow_up": {
         const followImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
-        await this.inner.followUp(command.message as string, followImages?.length ? followImages : undefined);
+        await this.inner.followUp(command.message as string, followImages?.length ? followImages : undefined,
+          { operationId: command.operationId as string | undefined, timestamp: command.timestamp as number | undefined });
         return null;
       }
 
