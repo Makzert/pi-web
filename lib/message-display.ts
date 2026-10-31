@@ -19,7 +19,12 @@ export function hasAssistantPhase(message: AgentMessage): message is AssistantMe
 }
 
 export function isGroupAnchor(message: AgentMessage): boolean {
-  return message.role === "user" || (message.role === "custom" && message.customType === "compaction");
+  return message.role === "user" || (message.role === "custom" && (
+    message.customType === "compaction"
+    || message.customType === "node-bg-result"
+    || message.customType === "node-worker-result"
+    || message.customType === "node-worker-input-required"
+  ));
 }
 
 // Explicit phases own their presentation; the legacy last-answer heuristic
@@ -107,4 +112,113 @@ export function splitFinalAssistantBlocks(
 
 export function countToolCallBlocks(blocks: AssistantContentBlock[]): number {
   return blocks.filter((block): block is ToolCallContent => block.type === "toolCall").length;
+}
+
+export interface MessageDisplayPart {
+  messageIndex: number;
+  blocks?: AssistantContentBlock[];
+  isLastPart?: boolean;
+}
+
+export interface MessageDisplayGroup {
+  kind: "message" | "process" | "answer" | "preview";
+  anchorIndex: number;
+  parts: MessageDisplayPart[];
+  isLive: boolean;
+}
+
+// Build one presentation plan for phased and legacy messages. A phase boundary
+// protects answers, but must not strand subsequent unclassified tool/thinking
+// messages outside process details. Receipt boundaries protect old answers too;
+// unlike users and compactions, the receipt itself belongs inside the new group.
+export function getMessageDisplayGroups(
+  messages: AgentMessage[],
+  options: { isRunning?: boolean } = {},
+): MessageDisplayGroup[] {
+  const groups: MessageDisplayGroup[] = [];
+  let anchorIndex = -1;
+  const append = (kind: MessageDisplayGroup["kind"], part: MessageDisplayPart) => {
+    const previous = groups.at(-1);
+    if (kind === "process" && previous?.kind === kind && previous.anchorIndex === anchorIndex) {
+      previous.parts.push(part);
+    } else {
+      groups.push({ kind, anchorIndex, parts: [part], isLive: false });
+    }
+  };
+  const appendAssistant = (
+    messageIndex: number,
+    parts: { kind: "process" | "answer" | "preview"; blocks: AssistantContentBlock[] }[],
+  ) => parts.forEach((part, index) => append(part.kind, {
+    messageIndex, blocks: part.blocks, isLastPart: index === parts.length - 1,
+  }));
+
+  for (let index = 0; index < messages.length;) {
+    const message = messages[index];
+    if (isGroupAnchor(message)) anchorIndex = index;
+    if (message.role === "user" || (message.role === "custom" && message.customType === "compaction")) {
+      append("message", { messageIndex: index++ });
+      continue;
+    }
+    if (hasAssistantPhase(message)) {
+      appendAssistant(index++, getPhasedAssistantParts(message));
+      continue;
+    }
+
+    // Keep the legacy trailing-answer heuristic local to an unclassified run;
+    // it cannot consume a native answer or cross a user/receipt boundary.
+    const end = findLegacyGroupEnd(messages, index);
+    let finalIndex = -1;
+    for (let candidate = end - 1; candidate >= index; candidate--) {
+      const entry = messages[candidate];
+      if (entry.role !== "assistant") continue;
+      if (finalIndex === -1) finalIndex = candidate;
+      if (splitFinalAssistantBlocks(entry).answerBlocks.some((block) => (
+        isVisualToolCallBlock(block) || block.type === "image"
+        || (block.type === "text" && block.text.trim().length > 0)
+      ))) {
+        finalIndex = candidate;
+        break;
+      }
+    }
+    for (; index < end; index++) {
+      const entry = messages[index];
+      if (entry.role === "assistant") {
+        const parts: { kind: "process" | "answer" | "preview"; blocks: AssistantContentBlock[] }[] = [];
+        const split = index === finalIndex ? splitFinalAssistantBlocks(entry) : {
+          processBlocks: getDisplayableAssistantBlocks(entry), answerBlocks: [],
+        };
+        for (const block of split.processBlocks) {
+          const kind = isVisualToolCallBlock(block) ? "preview" : "process";
+          const previous = parts.at(-1);
+          if (previous?.kind === kind) previous.blocks.push(block);
+          else parts.push({ kind, blocks: [block] });
+        }
+        if (split.answerBlocks.length > 0 || (index >= finalIndex && getAssistantErrorMessage(entry))) {
+          parts.push({ kind: "answer", blocks: split.answerBlocks });
+        }
+        appendAssistant(index, parts);
+      } else if (entry.role === "custom") {
+        // Node receipts are process data even when display=true. Other visible
+        // extension messages (notably /direct replies) are the actual output.
+        const isProcess = isGroupAnchor(entry) || entry.display === false;
+        append(isProcess ? "process" : "message", { messageIndex: index });
+      } else if (entry.role !== "toolResult") {
+        // Shell executions are independent user-visible actions. Tool results
+        // remain attached to their calls through MessageView's result map.
+        append("message", { messageIndex: index });
+      }
+    }
+  }
+
+  if (options.isRunning) {
+    // An opaque/legacy text message is not proof that a running turn finished.
+    // Only a native final answer can close current work before agent settlement.
+    const lastAnswer = groups.findLastIndex((group) => group.kind === "answer" && group.parts.some((part) => (
+      part.blocks?.some((block) => getTextPhase(block) === "final_answer")
+    )));
+    groups.forEach((group, index) => {
+      group.isLive = group.kind === "process" && group.anchorIndex === anchorIndex && index > lastAnswer;
+    });
+  }
+  return groups;
 }

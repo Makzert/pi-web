@@ -4,8 +4,8 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, use
 import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage, ToolCallContent, UserMessage } from "@/lib/types";
 import { normalizeCustomPanelLines, parseAnsiLine } from "@/lib/ansi";
 import { asBracketedPaste, toTerminalKeyData } from "@/lib/terminal-input";
-import { countToolCallBlocks, findLegacyGroupEnd, getAssistantErrorMessage, getDisplayableAssistantBlocks, getPhasedAssistantParts, hasAssistantPhase, isGroupAnchor, isVisualToolCallBlock, splitFinalAssistantBlocks } from "@/lib/message-display";
-import { MessageView } from "./MessageView";
+import { countToolCallBlocks, getMessageDisplayGroups, isVisualToolCallBlock, type MessageDisplayPart } from "@/lib/message-display";
+import { MessageView, type AssistantBlockRenderer } from "./MessageView";
 import { VideoPreview } from "./VideoPreview";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
@@ -113,21 +113,6 @@ function videoPreviewFromBlock(
   };
 }
 
-function videoPreviewsFromBlocks(
-  blocks: AssistantContentBlock[],
-  toolResults: Map<string, ToolResultMessage>,
-): VideoPreviewInfo[] {
-  const seen = new Set<string>();
-  const previews: VideoPreviewInfo[] = [];
-  for (const block of blocks) {
-    const preview = videoPreviewFromBlock(block, toolResults);
-    if (!preview || seen.has(preview.mediaUrl)) continue;
-    seen.add(preview.mediaUrl);
-    previews.push(preview);
-  }
-  return previews;
-}
-
 function VideoPreviewList({ previews }: { previews: VideoPreviewInfo[] }) {
   if (previews.length === 0) return null;
   return (
@@ -195,18 +180,6 @@ function imagePreviewFromBlock(
   return null;
 }
 
-function imagePreviewsFromBlocks(blocks: AssistantContentBlock[], toolResults: Map<string, ToolResultMessage>): ImagePreviewInfo[] {
-  const previews: ImagePreviewInfo[] = [];
-  const seen = new Set<string>();
-  for (const block of blocks) {
-    const preview = imagePreviewFromBlock(block, toolResults);
-    if (!preview || seen.has(preview.src)) continue;
-    seen.add(preview.src);
-    previews.push(preview);
-  }
-  return previews;
-}
-
 function formatPreviewBytes(bytes?: number): string {
   if (!Number.isFinite(bytes) || !bytes || bytes < 0) return "";
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
@@ -232,25 +205,6 @@ function ImagePreviewList({ previews }: { previews: ImagePreviewInfo[] }) {
   );
 }
 
-function hasFinalAssistantAnswer(message: AgentMessage): boolean {
-  if (message.role !== "assistant") return false;
-  return splitFinalAssistantBlocks(message as AssistantMessage).answerBlocks.some((block) => (
-    isVisualToolCallBlock(block)
-    || block.type === "image"
-    || (block.type === "text" && block.text.trim().length > 0)
-  ));
-}
-
-function findFinalAssistantIndex(messages: AgentMessage[], userIdx: number, endIdx: number): number {
-  for (let candidateIdx = endIdx - 1; candidateIdx > userIdx; candidateIdx--) {
-    if (hasFinalAssistantAnswer(messages[candidateIdx])) return candidateIdx;
-  }
-  for (let candidateIdx = endIdx - 1; candidateIdx > userIdx; candidateIdx--) {
-    if (messages[candidateIdx]?.role === "assistant") return candidateIdx;
-  }
-  return -1;
-}
-
 function getUserInputText(message: AgentMessage): string | null {
   if (message.role !== "user") return null;
   if (typeof message.content === "string") {
@@ -265,30 +219,21 @@ function getUserInputText(message: AgentMessage): string | null {
   return text.length > 0 ? text : null;
 }
 
-function countToolCalls(messages: AgentMessage[], indices: number[]): number {
-  let count = 0;
-  for (const idx of indices) {
-    const msg = messages[idx];
-    if (msg?.role !== "assistant") continue;
-    count += countToolCallBlocks(getDisplayableAssistantBlocks(msg as AssistantMessage));
-  }
-  return count;
-}
-
-function hasDisplayableProcessMessage(message: AgentMessage): boolean {
-  if (message.role === "assistant") {
-    return getDisplayableAssistantBlocks(message as AssistantMessage).length > 0;
-  }
-  return message.role === "custom";
-}
-
 function withAssistantBlocks(
   message: AssistantMessage,
   content: AssistantContentBlock[],
   options: { omitUsage?: boolean } = {},
 ): AssistantMessage {
-  const next = { ...message, content };
-  if (options.omitUsage) next.usage = undefined;
+  // Keep original block indices for deferred thinking retrieval, including
+  // legacy messages split across a process disclosure and a visible answer.
+  const next = { ...message, content: message.content.map((block): AssistantContentBlock => (
+    content.includes(block) ? block : { type: "thinking", thinking: "" }
+  )) };
+  if (options.omitUsage) {
+    next.usage = undefined;
+    next.stopReason = undefined;
+    next.errorMessage = undefined;
+  }
   return next;
 }
 
@@ -806,16 +751,6 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
               for (let i = messages.length - 1; i >= 0; i--) {
                 if (messages[i].role === "user") { lastUserIdx = i; break; }
               }
-              // Anchor for live-tail detection: the last user message, or a
-              // compaction summary when compaction has replaced it mid-turn.
-              // Computed independently from lastUserIdx (which is kept for the
-              // scroll-to-user ref) because a compaction summary can sit after
-              // the last user message and anchor the still-streaming segment.
-              let lastAnchorIdx = -1;
-              for (let i = messages.length - 1; i >= 0; i--) {
-                if (isGroupAnchor(messages[i])) { lastAnchorIdx = i; break; }
-              }
-
               const visibleRefIndexByMessage = new Map<number, number>();
               let refIdx = 0;
               messages.forEach((msg, idx) => {
@@ -829,7 +764,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                 if (idx === lastUserIdx) { (lastUserMsgRef as { current: HTMLDivElement | null }).current = el; }
               };
 
-              const renderMessage = (idx: number, options: { attachRef?: boolean; keyPrefix?: string; messageOverride?: AgentMessage; showTimestamp?: boolean } = {}): ReactNode => {
+              const renderMessage = (idx: number, options: { attachRef?: boolean; keyPrefix?: string; messageOverride?: AgentMessage; showTimestamp?: boolean; renderAssistantBlock?: AssistantBlockRenderer } = {}): ReactNode => {
                 const msg = options.messageOverride ?? messages[idx];
                 const prevAssistantEntryId =
                   msg.role === "user" && idx > 0 && messages[idx - 1].role === "assistant"
@@ -856,6 +791,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                   <MessageView
                     key={`${keyPrefix}-view-${idx}`}
                     message={msg}
+                    renderAssistantBlock={options.renderAssistantBlock}
                     toolResults={toolResultsMap}
                     modelNames={modelNames}
                     cwd={messageCwd}
@@ -879,152 +815,82 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                 );
               };
 
-              const rendered: ReactNode[] = [];
-              for (let idx = 0; idx < messages.length;) {
-                const msg = messages[idx];
-                if (hasAssistantPhase(msg)) {
-                  const parts = getPhasedAssistantParts(msg);
-                  const firstAnswer = parts.findIndex((part) => part.kind === "answer");
-                  const refPart = firstAnswer < 0 ? 0 : firstAnswer;
-                  parts.forEach((part, partIdx) => {
-                    const isLast = partIdx === parts.length - 1;
-                    // Keep file block indices for deferred thinking lookups.
-                    // MessageView filters these empty thinking placeholders.
-                    const blocks = msg.content.map((block): AssistantContentBlock => part.blocks.includes(block)
-                      ? block : { type: "thinking", thinking: "" });
-                    const message = withAssistantBlocks(msg, blocks, { omitUsage: !isLast });
-                    if (!isLast) {
-                      message.stopReason = undefined;
-                      message.errorMessage = undefined;
-                    }
-                    const content = renderMessage(idx, {
-                      attachRef: false,
-                      keyPrefix: `phase-${partIdx}`,
-                      messageOverride: message,
-                      showTimestamp: isLast && part.kind === "answer",
-                    });
-                    const refIndex = visibleRefIndexByMessage.get(idx);
-                    rendered.push(
-                      <div key={`phase-${entryIds[idx] ?? idx}-${partIdx}`}
-                        ref={partIdx === refPart && refIndex !== undefined ? attachVisibleRef(idx, refIndex) : undefined}>
-                        {part.kind === "answer" ? content : (
-                          <ProcessDetailsGroup messageCount={1} toolCallCount={countToolCallBlocks(part.blocks)} t={t}>
-                            {content}
-                          </ProcessDetailsGroup>
-                        )}
-                      </div>,
-                    );
-                  });
-                  idx += 1;
-                  continue;
-                }
-                if (!isGroupAnchor(msg)) {
-                  rendered.push(renderMessage(idx));
-                  idx += 1;
-                  continue;
-                }
-
-                const userIdx = idx;
-                const endIdx = findLegacyGroupEnd(messages, userIdx);
-
-                const finalAssistantIdx = findFinalAssistantIndex(messages, userIdx, endIdx);
-
-                if (finalAssistantIdx === -1) {
-                  for (let renderIdx = userIdx; renderIdx < endIdx; renderIdx++) {
-                    rendered.push(renderMessage(renderIdx));
+              const groups = getMessageDisplayGroups(messages, { isRunning: sessionBusy || streamState.isStreaming });
+              // Prefer visible answers for minimap targets; process-only entries
+              // point to their outer disclosure, not an unmounted hidden child.
+              const refParts = new Map<number, MessageDisplayPart>();
+              for (const group of groups) {
+                if (group.kind === "answer" || group.kind === "preview") {
+                  for (const part of group.parts) {
+                    if (!refParts.has(part.messageIndex)) refParts.set(part.messageIndex, part);
                   }
-                  idx = endIdx;
-                  continue;
                 }
-
-                const isLiveTail = (sessionBusy || streamState.isStreaming) && endIdx === messages.length && userIdx === lastAnchorIdx;
-                if (isLiveTail) {
-                  for (let renderIdx = userIdx; renderIdx < endIdx; renderIdx++) {
-                    rendered.push(renderMessage(renderIdx));
-                  }
-                  idx = endIdx;
-                  continue;
-                }
-
-                rendered.push(renderMessage(userIdx));
-
-                const processIndices: number[] = [];
-                for (let processIdx = userIdx + 1; processIdx < finalAssistantIdx; processIdx++) {
-                  processIndices.push(processIdx);
-                }
-                // A node_video result is a visual answer, not collapsible
-                // process/COT. Remove its assistant message from the process
-                // group and render its preview as a sibling below the group.
-                const visualProcessIndices = processIndices.filter((processIdx) => {
-                  const message = messages[processIdx];
-                  return message?.role === "assistant"
-                    && message.content.some((block) => isVisualToolCallBlock(block));
-                });
-                const visibleProcessIndices = processIndices.filter((processIdx) => {
-                  const message = messages[processIdx];
-                  return hasDisplayableProcessMessage(message)
-                    && !(message?.role === "assistant" && message.content.some((block) => isVisualToolCallBlock(block)));
-                });
-                const finalAssistant = messages[finalAssistantIdx] as AssistantMessage;
-                const finalSplit = splitFinalAssistantBlocks(finalAssistant);
-                const cleanFinalProcessBlocks = finalSplit.processBlocks.filter((block) => !isVisualToolCallBlock(block));
-                const finalProcessMessage = cleanFinalProcessBlocks.length > 0
-                  ? withAssistantBlocks(finalAssistant, cleanFinalProcessBlocks, { omitUsage: true })
-                  : null;
-                const finalAnswerMessage = finalSplit.answerBlocks.length > 0 || getAssistantErrorMessage(finalAssistant)
-                  ? withAssistantBlocks(finalAssistant, finalSplit.answerBlocks)
-                  : null;
-
-                const processCount = visibleProcessIndices.length + (finalProcessMessage ? 1 : 0);
-                const visualBlocks = visualProcessIndices.flatMap((processIdx) => {
-                  const message = messages[processIdx];
-                  return message?.role === "assistant" ? getDisplayableAssistantBlocks(message as AssistantMessage) : [];
-                });
-                const visualBlocksForPreview = [...visualBlocks, ...finalSplit.processBlocks];
-                const visualPreviews = videoPreviewsFromBlocks(visualBlocksForPreview, toolResultsMap);
-                const imagePreviews = imagePreviewsFromBlocks(visualBlocksForPreview, toolResultsMap);
-                if (processCount > 0) {
-                  const processRefIdx = visibleProcessIndices
-                    .map((processIdx) => visibleRefIndexByMessage.get(processIdx))
-                    .find((value): value is number => typeof value === "number")
-                    ?? (finalAnswerMessage ? undefined : visibleRefIndexByMessage.get(finalAssistantIdx));
-                  const processGroup = (
-                    <ProcessDetailsGroup
-                       messageCount={processCount}
-                       t={t}
-                      toolCallCount={countToolCalls(messages, visibleProcessIndices) + countToolCallBlocks(cleanFinalProcessBlocks)}
-                    >
-                      {visibleProcessIndices.map((processIdx) => renderMessage(processIdx, { attachRef: false, keyPrefix: "process" }))}
-                      {finalProcessMessage && renderMessage(finalAssistantIdx, { attachRef: false, keyPrefix: "process-final", messageOverride: finalProcessMessage, showTimestamp: false })}
-                    </ProcessDetailsGroup>
-                  );
-                  rendered.push(
-                    <div
-                      key={`process-group-${userIdx}-${finalAssistantIdx}`}
-                      ref={processRefIdx === undefined ? undefined : (el) => { messageRefs.current[processRefIdx] = el; }}
-                    >
-                      {processGroup}
-                    </div>,
-                  );
-                }
-
-                if (visualPreviews.length > 0 || imagePreviews.length > 0) {
-                  rendered.push(
-                    <Fragment key={`visual-previews-${userIdx}-${finalAssistantIdx}`}>
-                      <VideoPreviewList previews={visualPreviews} />
-                      <ImagePreviewList previews={imagePreviews} />
-                    </Fragment>,
-                  );
-                }
-
-                if (finalAnswerMessage) {
-                  rendered.push(renderMessage(finalAssistantIdx, { messageOverride: finalAnswerMessage }));
-                }
-                for (let renderIdx = finalAssistantIdx + 1; renderIdx < endIdx; renderIdx++) {
-                  rendered.push(renderMessage(renderIdx));
-                }
-                idx = endIdx;
               }
+              for (const group of groups) {
+                for (const part of group.parts) {
+                  if (!refParts.has(part.messageIndex)) refParts.set(part.messageIndex, part);
+                }
+              }
+              const partKey = (part: MessageDisplayPart) => {
+                const original = messages[part.messageIndex];
+                const blockIndex = original.role === "assistant" && part.blocks
+                  ? original.content.indexOf(part.blocks[0]) : "whole";
+                return `${entryIds[part.messageIndex] ?? part.messageIndex}-${blockIndex}`;
+              };
+              const renderPart = (part: MessageDisplayPart, attachRef = true, renderAssistantBlock?: AssistantBlockRenderer) => {
+                const original = messages[part.messageIndex];
+                return renderMessage(part.messageIndex, {
+                  attachRef: attachRef && refParts.get(part.messageIndex) === part,
+                  keyPrefix: partKey(part),
+                  renderAssistantBlock,
+                  ...(original.role === "assistant" && part.blocks ? {
+                    messageOverride: withAssistantBlocks(original, part.blocks, { omitUsage: !part.isLastPart }),
+                    ...(!part.isLastPart ? { showTimestamp: false } : {}),
+                  } : {}),
+                });
+              };
+              const attachGroupRefs = (parts: MessageDisplayPart[]) => (element: HTMLDivElement | null) => {
+                for (const part of parts) {
+                  const refIndex = visibleRefIndexByMessage.get(part.messageIndex);
+                  if (refIndex !== undefined && refParts.get(part.messageIndex) === part) {
+                    attachVisibleRef(part.messageIndex, refIndex)(element);
+                  }
+                }
+              };
+              const rendered: ReactNode[] = groups.map((group) => {
+                const key = `${group.kind}-${partKey(group.parts[0])}`;
+                if (group.kind === "process" && !group.isLive) {
+                  return (
+                    <div key={key} ref={attachGroupRefs(group.parts)}>
+                      <ProcessDetailsGroup
+                        messageCount={new Set(group.parts.map((part) => part.messageIndex)).size}
+                        toolCallCount={group.parts.reduce((count, part) => count + countToolCallBlocks(part.blocks ?? []), 0)}
+                        t={t}
+                      >
+                        {group.parts.map((part) => renderPart(part, false))}
+                      </ProcessDetailsGroup>
+                    </div>
+                  );
+                }
+                if (group.kind === "preview") {
+                  const renderPreviewBlock: AssistantBlockRenderer = (block) => {
+                    const video = videoPreviewFromBlock(block, toolResultsMap);
+                    if (video) return <VideoPreviewList previews={[video]} />;
+                    const image = imagePreviewFromBlock(block, toolResultsMap);
+                    if (image) return <ImagePreviewList previews={[image]} />;
+                    // Unsupported/failed calls use the normal tool disclosure.
+                    return undefined;
+                  };
+                  return (
+                    <div key={key} ref={attachGroupRefs(group.parts)}>
+                      {/* Replace media content, not its message frame. Error and
+                          usage ownership remain on the original final part. */}
+                      {group.parts.map((part) => renderPart(part, false, renderPreviewBlock))}
+                    </div>
+                  );
+                }
+                return <Fragment key={key}>{group.parts.map((part) => renderPart(part))}</Fragment>;
+              });
               const { startIndex, hasMore } = getVisibleRenderWindow(rendered.length, visibleCount);
               return (
                 <>

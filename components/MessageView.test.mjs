@@ -11,12 +11,12 @@ const jiti = createJiti(import.meta.url, {
 const { MessageView, replaceUserMessageText } = await jiti.import("./MessageView.tsx");
 const { I18nProvider } = await jiti.import("../hooks/useI18n.tsx");
 
-function renderMessage(message) {
+function renderMessage(message, options = {}) {
   return renderToStaticMarkup(
     React.createElement(
       I18nProvider,
       null,
-      React.createElement(MessageView, { message }),
+      React.createElement(MessageView, { message, ...options }),
     ),
   );
 }
@@ -56,6 +56,30 @@ test("renders partial assistant content before the provider error", () => {
 
   assert.match(html, /Partial response/);
   assert.match(html, /Error: Connection closed/);
+});
+
+test("custom assistant block content shares the normal metadata frame and undefined falls back", () => {
+  const message = {
+    role: "assistant", provider: "test", model: "fixture", stopReason: "error",
+    errorMessage: "CUSTOM_RENDER_PROVIDER_ERROR",
+    usage: { input: 731, output: 953, cacheRead: 0, cacheWrite: 0, cost: { total: 0.1731 } },
+    content: [{ type: "text", text: "DEFAULT_TEXT_CONTENT" },
+      { type: "toolCall", toolCallId: "image", toolName: "node_image", input: {} }],
+  };
+  const html = renderMessage(message, { renderAssistantBlock: (block) => block.type === "toolCall"
+    ? React.createElement("div", null, "CUSTOM_MEDIA_CONTENT") : undefined });
+  assert.match(html, /DEFAULT_TEXT_CONTENT/);
+  assert.equal((html.match(/CUSTOM_MEDIA_CONTENT/g) ?? []).length, 1);
+  assert.equal((html.match(/CUSTOM_RENDER_PROVIDER_ERROR/g) ?? []).length, 1);
+  assert.equal((html.match(/731 in/g) ?? []).length, 1);
+  assert.equal((html.match(/\$0\.1731/g) ?? []).length, 1);
+});
+
+test("memo comparison invalidates a changed assistant block renderer", () => {
+  const message = { role: "assistant", content: [{ type: "text", text: "same message" }] };
+  const before = { message, renderAssistantBlock: () => "before" };
+  assert.equal(MessageView.compare(before, before), true);
+  assert.equal(MessageView.compare(before, { ...before, renderAssistantBlock: () => "after" }), false);
 });
 
 test("renders a complete SDK skill expansion as a compact command", () => {
