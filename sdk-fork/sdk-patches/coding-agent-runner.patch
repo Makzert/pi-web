@@ -1,0 +1,44 @@
+--- a/dist/core/extensions/runner.js
++++ b/dist/core/extensions/runner.js
+@@ -158,6 +158,8 @@
+     bindCore(actions, contextActions, providerActions) {
+         // Copy actions into the shared runtime (all extension APIs reference this)
+         this.runtime.sendMessage = actions.sendMessage;
++        this.runtime.postEvent = actions.postEvent;
++        this.runtime.waitForSessionEvent = actions.waitForSessionEvent;
+         this.runtime.sendUserMessage = actions.sendUserMessage;
+         this.runtime.appendEntry = actions.appendEntry;
+         this.runtime.setSessionName = actions.setSessionName;
+@@ -646,6 +648,25 @@
+         }
+         return modified ? currentMessage : undefined;
+     }
++    /** Required stage gate: unlike ordinary extension events, failures propagate. */
++    async emitStageCommit(event) {
++        const ctx = this.createContext();
++        let handlerCount = 0;
++        let result;
++        for (const ext of this.extensions) {
++            for (const handler of ext.handlers.get("stage_commit") ?? []) {
++                handlerCount++;
++                if (handlerCount > 1) throw new Error("managed Brain has multiple stage commit handlers");
++                result = await handler(event, ctx);
++            }
++        }
++        if (handlerCount === 0 && process.env.ULTRON_MANAGED_BRAIN === "1") {
++            const error = new Error("managed Brain has no stage commit handler");
++            error.code = "STAGE_COMMIT_UNAVAILABLE";
++            throw error;
++        }
++        return result;
++    }
+     async emitToolResult(event) {
+         const ctx = this.createContext();
+         const currentEvent = { ...event };
+@@ -964,4 +985,4 @@
+             : { action: "continue" };
+     }
+ }
+-//# sourceMappingURL=runner.js.map
+\ No newline at end of file
++//# sourceMappingURL=runner.js.map

@@ -1,0 +1,18 @@
+--- a/dist/types.d.ts
++++ b/dist/types.d.ts
+@@ -219,6 +219,8 @@
+      * Contract: must not throw or reject. Return [] when no follow-up messages are available.
+      */
+     getFollowUpMessages?: () => Promise<AgentMessage[]>;
++    /** Return committed next-turn messages after the direct user prompt is accepted. */
++    getNextTurnMessages?: () => Promise<AgentMessage[]>;
+     /**
+      * Tool execution mode.
+      * - "sequential": execute tool calls one by one
+@@ -410,4 +412,4 @@
+     result: any;
+     isError: boolean;
+ };
+-//# sourceMappingURL=types.d.ts.map
+\ No newline at end of file
++//# sourceMappingURL=types.d.ts.map

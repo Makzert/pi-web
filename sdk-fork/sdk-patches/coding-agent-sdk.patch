@@ -1,0 +1,19 @@
+--- a/dist/core/sdk.js
++++ b/dist/core/sdk.js
+@@ -64,6 +64,9 @@
+  * ```
+  */
+ export async function createAgentSession(options = {}) {
++    if (process.env.ULTRON_MANAGED_BRAIN === "1") {
++        throw new Error("managed Brain cannot start without a real majority-commit StageStore");
++    }
+     const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
+     const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
+     let resourceLoader = options.resourceLoader;
+@@ -265,4 +268,4 @@
+         modelFallbackMessage,
+     };
+ }
+-//# sourceMappingURL=sdk.js.map
+\ No newline at end of file
++//# sourceMappingURL=sdk.js.map

@@ -1,0 +1,114 @@
+--- a/dist/core/agent-session.d.ts
++++ b/dist/core/agent-session.d.ts
+@@ -50,6 +50,15 @@
+     steering: readonly string[];
+     followUp: readonly string[];
+ } | {
++    type: "session_wait_start";
++    waitId: string;
++    startedAt: number;
++    deadlineAt: number;
++} | {
++    type: "session_wait_end";
++    waitId: string;
++    reason: "event" | "timeout" | "user_input" | "aborted";
++} | {
+     type: "compaction_start";
+     reason: "manual" | "threshold" | "overflow";
+ } | {
+@@ -152,6 +161,9 @@
+ }
+ /** Options for AgentSession.prompt() */
+ export interface PromptOptions {
++    /** Stable admission identity and timestamp for queued input retries. */
++    operationId?: string;
++    timestamp?: number;
+     /** Whether to dispatch extension commands and expand skill commands and prompt templates (default: true) */
+     expandPromptTemplates?: boolean;
+     /** Image attachments */
+@@ -162,6 +174,8 @@
+     source?: InputSource;
+     /** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
+     preflightResult?: (success: boolean) => void;
++    /** Called only after the direct user message has crossed the stage barrier. */
++    acceptedResult?: (accepted: boolean) => void;
+ }
+ /** Result from cycleModel() */
+ export interface ModelCycleResult {
+@@ -353,6 +367,7 @@
+      * @throws Error if no model selected or no API key available (when not streaming)
+      */
+     prompt(text: string, options?: PromptOptions): Promise<void>;
++    resumePendingQueueTake(): Promise<boolean>;
+     private _tryExecuteExtensionCommand;
+     /**
+      * Expand skill commands (/skill:name args) to their full content.
+@@ -368,7 +383,7 @@
+      * @param images Optional image attachments to include with the message
+      * @throws Error if text is an extension command
+      */
+-    steer(text: string, images?: ImageContent[]): Promise<void>;
++    steer(text: string, images?: ImageContent[], options?: { operationId?: string; timestamp?: number }): Promise<void>;
+     /**
+      * Queue a follow-up message to be processed after the agent finishes.
+      * Delivered only when agent has no more tool calls or steering messages.
+@@ -376,7 +391,7 @@
+      * @param images Optional image attachments to include with the message
+      * @throws Error if text is an extension command
+      */
+-    followUp(text: string, images?: ImageContent[]): Promise<void>;
++    followUp(text: string, images?: ImageContent[], options?: { operationId?: string; timestamp?: number }): Promise<void>;
+     private _queueSteer;
+     private _queueFollowUp;
+     /**
+@@ -410,6 +425,8 @@
+     sendUserMessage(content: string | (TextContent | ImageContent)[], options?: {
+         deliverAs?: "steer" | "followUp";
+         expandPromptTemplates?: boolean;
++        operationId?: string;
++        timestamp?: number;
+     }): Promise<void>;
+     /**
+      * Clear all queued messages and return them.
+@@ -420,6 +437,10 @@
+         steering: string[];
+         followUp: string[];
+     };
++    clearQueueCommitted(operationId?: string): Promise<{
++        steering: string[];
++        followUp: string[];
++    }>;
+     /** Number of pending messages (includes both steering and follow-up) */
+     get pendingMessageCount(): number;
+     /** Get pending steering messages (read-only) */
+@@ -432,6 +453,9 @@
+      */
+     abort(): Promise<void>;
+     waitForIdle(): Promise<void>;
++    getSessionWaitState(): { waitId: string; startedAt: number; deadlineAt: number } | null;
++    postSessionEvent<T = unknown>(message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">): Promise<{ sessionId: string; deliveryId: string; accepted: true }>;
++    waitForSessionEvent(timeoutMs: number, signal?: AbortSignal): Promise<{ reason: "event" | "timeout" | "user_input"; waitedMs: number }>;
+     private _emitModelSelect;
+     /**
+      * Set model directly.
+@@ -476,11 +500,13 @@
+      * Saves to settings.
+      */
+     setSteeringMode(mode: "all" | "one-at-a-time"): void;
++    setSteeringModeCommitted(mode: "all" | "one-at-a-time", operationId?: string): Promise<void>;
+     /**
+      * Set follow-up message mode.
+      * Saves to settings.
+      */
+     setFollowUpMode(mode: "all" | "one-at-a-time"): void;
++    setFollowUpModeCommitted(mode: "all" | "one-at-a-time", operationId?: string): Promise<void>;
+     /**
+      * Manually compact the session context.
+      * Aborts current agent operation first.
+@@ -646,4 +672,4 @@
+      */
+     get extensionRunner(): ExtensionRunner;
+ }
+-//# sourceMappingURL=agent-session.d.ts.map
+\ No newline at end of file
++//# sourceMappingURL=agent-session.d.ts.map

@@ -1,0 +1,39 @@
+--- a/dist/agent.d.ts
++++ b/dist/agent.d.ts
+@@ -56,6 +56,11 @@
+     maxRetryDelayMs?: number;
+     /** Tool execution strategy for assistant messages that contain multiple tool calls. */
+     toolExecution: ToolExecutionMode;
++    /** Host-authoritative queue take callback for managed sessions. */
++    queueConsumer?: (lane: "steer" | "followUp" | "nextTurn" | "events") => Promise<AgentMessage[]>;
++    queueHasItems?: () => boolean;
++    eventConsumer?: (mode: "boundary" | "idle") => Promise<AgentMessage[]>;
++    eventHasItems?: () => boolean;
+     constructor(options: AgentOptions);
+     /**
+      * Subscribe to agent lifecycle events.
+@@ -90,6 +95,9 @@
+     clearFollowUpQueue(): void;
+     /** Remove all queued steering and follow-up messages. */
+     clearAllQueues(): void;
++    /** Pause queue consumption until the returned function is called. */
++    pauseQueuedMessages(): () => void;
++    private drainQueuedMessages;
+     /** Returns true when either queue still contains pending messages. */
+     hasQueuedMessages(): boolean;
+     /** Active abort signal for the current run, if any. */
+@@ -107,6 +115,7 @@
+     /** Start a new prompt from text, a single message, or a batch of messages. */
+     prompt(message: AgentMessage | AgentMessage[]): Promise<void>;
+     prompt(input: string, images?: ImageContent[]): Promise<void>;
++    runCommittedQueueMessages(messages: AgentMessage[], lane: "steer" | "followUp" | "nextTurn" | "events"): Promise<void>;
+     /** Continue from the current transcript. The last message must be a user or tool-result message. */
+     continue(): Promise<void>;
+     private normalizePromptInput;
+@@ -119,4 +128,4 @@
+     private finishRun;
+     private processEvents;
+ }
+-//# sourceMappingURL=agent.d.ts.map
+\ No newline at end of file
++//# sourceMappingURL=agent.d.ts.map

@@ -24,10 +24,12 @@
     "!.next/dev",
     "!.next/**/*.js.map",
     "public",
+    "sdk-fork",
     "next.config.ts",
     "package.json"
   ],
   "scripts": {
+    "postinstall": "node sdk-fork/apply-sdk-fork.mjs",
     "dev": "next dev -H 127.0.0.1 -p 30141",
     "dev:lan": "next dev -H 0.0.0.0 -p 30141",
     "build": "next build --webpack",
@@ -38,10 +40,10 @@
     "release": "npm version patch --no-git-tag-version && npm run build && npm publish --access public"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "0.84.0",
-    "@earendil-works/pi-ai": "0.84.0",
-    "@earendil-works/pi-coding-agent": "0.84.0",
-    "@earendil-works/pi-tui": "0.84.0",
+    "@earendil-works/pi-agent-core": "0.84.2",
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-tui": "0.84.2",
     "next": "16.2.12",
     "proper-lockfile": "4.1.2",
     "react": "^19.2.4",
@@ -72,5 +74,8 @@
     "remark-math": "^6.0.0",
     "tailwindcss": "^4.2.2",
     "typescript": "^5"
+  },
+  "overrides": {
+    "@earendil-works/pi-telemetry": "0.84.2"
   }
 }

@@ -1,0 +1,166 @@
+--- a/dist/agent.js
++++ b/dist/agent.js
+@@ -88,6 +88,11 @@
+     listeners = new Set();
+     steeringQueue;
+     followUpQueue;
++    queuedMessagePause;
++    queueConsumer;
++    queueHasItems;
++    eventConsumer;
++    eventHasItems;
+     convertToLlm;
+     transformContext;
+     streamFunction;
+@@ -171,18 +176,22 @@
+     }
+     /** Queue a message to be injected after the current assistant turn finishes. */
+     steer(message) {
++        if (this.queueConsumer) throw new Error("managed Brain: use committed queue admission");
+         this.steeringQueue.enqueue(message);
+     }
+     /** Queue a message to run only after the agent would otherwise stop. */
+     followUp(message) {
++        if (this.queueConsumer) throw new Error("managed Brain: use committed queue admission");
+         this.followUpQueue.enqueue(message);
+     }
+     /** Remove all queued steering messages. */
+     clearSteeringQueue() {
++        if (this.queueConsumer) throw new Error("managed Brain: use committed queue clear");
+         this.steeringQueue.clear();
+     }
+     /** Remove all queued follow-up messages. */
+     clearFollowUpQueue() {
++        if (this.queueConsumer) throw new Error("managed Brain: use committed queue clear");
+         this.followUpQueue.clear();
+     }
+     /** Remove all queued steering and follow-up messages. */
+@@ -190,9 +199,34 @@
+         this.clearSteeringQueue();
+         this.clearFollowUpQueue();
+     }
++    /** Pause queue consumption while a cancellation stage is being committed. */
++    pauseQueuedMessages() {
++        if (!this.queuedMessagePause) {
++            let resume;
++            const promise = new Promise((resolve) => { resume = resolve; });
++            this.queuedMessagePause = { count: 0, promise, resume };
++        }
++        const pause = this.queuedMessagePause;
++        pause.count++;
++        let released = false;
++        return () => {
++            if (released) return;
++            released = true;
++            if (--pause.count === 0) {
++                if (this.queuedMessagePause === pause) this.queuedMessagePause = undefined;
++                pause.resume();
++            }
++        };
++    }
++    async drainQueuedMessages(queue, lane) {
++        while (this.queuedMessagePause) await this.queuedMessagePause.promise;
++        if (this.queueConsumer) return this.queueConsumer(lane);
++        return queue.drain();
++    }
+     /** Returns true when either queue still contains pending messages. */
+     hasQueuedMessages() {
+-        return this.steeringQueue.hasItems() || this.followUpQueue.hasItems();
++        if (this.queueHasItems) return this.queueHasItems() || Boolean(this.eventHasItems?.());
++        return this.steeringQueue.hasItems() || this.followUpQueue.hasItems() || Boolean(this.eventHasItems?.());
+     }
+     /** Active abort signal for the current run, if any. */
+     get signal() {
+@@ -228,7 +262,13 @@
+             throw new Error("Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.");
+         }
+         const messages = this.normalizePromptInput(input, images);
+-        await this.runPromptMessages(messages);
++        await this.runPromptMessages(messages, { includeNextTurn: true });
++    }
++    /** Resume a queue take whose commit receipt was previously unknown. */
++    async runCommittedQueueMessages(messages, lane) {
++        if (this.activeRun) throw new Error("Agent is already processing.");
++        if (!Array.isArray(messages) || messages.length === 0) throw new Error("No committed queue messages to process");
++        await this.runPromptMessages(messages, { skipInitialSteeringPoll: lane === "steer" });
+     }
+     /** Continue from the current transcript. The last message must be a user or tool-result message. */
+     async continue() {
+@@ -240,14 +280,19 @@
+             throw new Error("No messages to continue from");
+         }
+         if (lastMessage.role === "assistant") {
+-            const queuedSteering = this.steeringQueue.drain();
++            const queuedSteering = await this.drainQueuedMessages(this.steeringQueue, "steer");
+             if (queuedSteering.length > 0) {
+                 await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
+                 return;
+             }
+-            const queuedFollowUps = this.followUpQueue.drain();
++            const queuedFollowUps = await this.drainQueuedMessages(this.followUpQueue, "followUp");
+             if (queuedFollowUps.length > 0) {
+                 await this.runPromptMessages(queuedFollowUps);
++                return;
++            }
++            const events = await this.eventConsumer?.("idle") ?? [];
++            if (events.length) {
++                await this.runPromptMessages(events);
+                 return;
+             }
+             throw new Error("Cannot continue from message role: assistant");
+@@ -318,9 +363,16 @@
+                     skipInitialSteeringPoll = false;
+                     return [];
+                 }
+-                return this.steeringQueue.drain();
++                const steering = await this.drainQueuedMessages(this.steeringQueue, "steer");
++                const events = this.signal?.aborted ? [] : await this.eventConsumer?.("boundary") ?? [];
++                return [...steering, ...events];
+             },
+-            getFollowUpMessages: async () => this.followUpQueue.drain(),
++            getFollowUpMessages: async () => {
++                const messages = await this.drainQueuedMessages(this.followUpQueue, "followUp");
++                return messages.length || this.signal?.aborted ? messages : await this.eventConsumer?.("idle") ?? [];
++            },
++            getNextTurnMessages: options.includeNextTurn && this.queueConsumer
++                ? async () => this.drainQueuedMessages(this.followUpQueue, "nextTurn") : undefined,
+         };
+     }
+     async runWithLifecycle(executor) {
+@@ -340,6 +392,11 @@
+             await executor(abortController.signal);
+         }
+         catch (error) {
++            // A stage commit failure is an infrastructure barrier, not an assistant
++            // response. The caller must keep the session stopped until it is resolved.
++            if (error?.code === "STAGE_COMMIT_UNAVAILABLE" || error?.code === "STAGE_COMMIT_CONFLICT") {
++                throw error;
++            }
+             await this.handleRunFailure(error, abortController.signal.aborted);
+         }
+         finally {
+@@ -386,8 +443,9 @@
+                 this._state.streamingMessage = event.message;
+                 break;
+             case "message_end":
+-                this._state.streamingMessage = undefined;
+-                this._state.messages.push(event.message);
++                // The awaited session listener commits this complete message before
++                // it may become accepted agent state. A rejected commit leaves state
++                // unchanged and prevents the loop from dispatching tool calls.
+                 break;
+             case "tool_execution_start": {
+                 const pendingToolCalls = new Set(this._state.pendingToolCalls);
+@@ -417,6 +475,10 @@
+         for (const listener of this.listeners) {
+             await listener(event, signal);
+         }
++        if (event.type === "message_end") {
++            this._state.streamingMessage = undefined;
++            this._state.messages.push(event.message);
++        }
+     }
+ }
+-//# sourceMappingURL=agent.js.map
+\ No newline at end of file
++//# sourceMappingURL=agent.js.map

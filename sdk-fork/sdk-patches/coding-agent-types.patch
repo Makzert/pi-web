@@ -1,0 +1,58 @@
+--- a/dist/core/extensions/types.d.ts
++++ b/dist/core/extensions/types.d.ts
+@@ -921,11 +921,15 @@
+     registerMarkdownTransformer(transformer: MarkdownTransformer): void;
+     /** Register a custom renderer for CustomEntry. Custom entries do not participate in LLM context. */
+     registerEntryRenderer<T = unknown>(customType: string, renderer: EntryRenderer<T>): void;
++    /** Reliably admit a background tool event; resolves on receipt, not model completion. */
++    postEvent<T = unknown>(message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">): Promise<{ sessionId: string; deliveryId: string; accepted: true }>;
++    /** Suspend this session's active Agent until an event, accepted steer input, or timeout. */
++    waitForSessionEvent(timeoutMs: number, signal?: AbortSignal): Promise<{ reason: "event" | "timeout" | "user_input"; waitedMs: number }>;
+     /** Send a custom message to the session. */
+     sendMessage<T = unknown>(message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">, options?: {
+         triggerTurn?: boolean;
+         deliverAs?: "steer" | "followUp" | "nextTurn";
+-    }): void;
++    }): Promise<void>;
+     /**
+      * Send a user message to the agent. Always triggers a turn.
+      * When the agent is streaming, use deliverAs to specify how to queue the message.
+@@ -934,7 +938,7 @@
+     sendUserMessage(content: string | (TextContent | ImageContent)[], options?: {
+         deliverAs?: "steer" | "followUp";
+         expandPromptTemplates?: boolean;
+-    }): void;
++    }): Promise<void>;
+     /** Append a custom entry to the session for state persistence (not sent to LLM). */
+     appendEntry<T = unknown>(customType: string, data?: T): void;
+     /** Set the session display name (shown in session selector). */
+@@ -1133,11 +1137,11 @@
+ export type SendMessageHandler = <T = unknown>(message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">, options?: {
+     triggerTurn?: boolean;
+     deliverAs?: "steer" | "followUp" | "nextTurn";
+-}) => void;
++}) => Promise<void>;
+ export type SendUserMessageHandler = (content: string | (TextContent | ImageContent)[], options?: {
+     deliverAs?: "steer" | "followUp";
+     expandPromptTemplates?: boolean;
+-}) => void;
++}) => Promise<void>;
+ export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
+ export type SetSessionNameHandler = (name: string) => void;
+ export type GetSessionNameHandler = () => string | undefined;
+@@ -1192,6 +1196,8 @@
+  * Provided to runner.initialize(), copied into the shared runtime.
+  */
+ export interface ExtensionActions {
++    postEvent: ExtensionAPI["postEvent"];
++    waitForSessionEvent: ExtensionAPI["waitForSessionEvent"];
+     sendMessage: SendMessageHandler;
+     sendUserMessage: SendUserMessageHandler;
+     appendEntry: AppendEntryHandler;
+@@ -1296,4 +1302,4 @@
+     error: string;
+     stack?: string;
+ }
+-//# sourceMappingURL=types.d.ts.map
+\ No newline at end of file
++//# sourceMappingURL=types.d.ts.map

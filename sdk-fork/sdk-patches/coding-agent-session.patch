@@ -1,0 +1,899 @@
+--- a/dist/core/agent-session.js
++++ b/dist/core/agent-session.js
+@@ -13,6 +13,7 @@
+  * Modes use this class and add their own I/O layer on top.
+  */
+ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
++import { createHash, randomUUID } from "node:crypto";
+ import { basename, dirname } from "node:path";
+ import { contentText } from "@earendil-works/pi-ai";
+ import { clampThinkingLevel, cleanupSessionResources, getSupportedThinkingLevels, isContextOverflow, isRecoverableLength, isRetryableAssistantError, modelsAreEqual, resetApiProviders, streamSimple, } from "@earendil-works/pi-ai/compat";
+@@ -38,6 +39,7 @@
+ import { createAllToolDefinitions } from "./tools/index.js";
+ import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
+ import { addUsageToTotals, createUsageTotals } from "./usage-totals.js";
++import { SessionEvents, eventBatchSize } from "./session-events.js";
+ /**
+  * Parse a skill block from message text.
+  * Returns null if the text doesn't contain a skill block.
+@@ -73,6 +75,16 @@
+ // ============================================================================
+ /** Standard thinking levels */
+ const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"];
++function rejectUnstagedManagedOperation(operation) {
++    if (process.env.ULTRON_MANAGED_BRAIN !== "1")
++        return;
++    const error = new Error(`managed Brain: ${operation} has no stage barrier`);
++    error.code = "STAGE_COMMIT_UNAVAILABLE";
++    throw error;
++}
++function queueAdmissionHash(value) {
++    return createHash("sha256").update(JSON.stringify(value)).digest("hex");
++}
+ // ============================================================================
+ // AgentSession Class
+ // ============================================================================
+@@ -108,7 +120,17 @@
+     // Extension system
+     _extensionRunner;
+     _turnIndex = 0;
++    _applyingCommittedModelStage = false;
++    _queueMutationTail = Promise.resolve();
++    _managedQueueActive = false;
++    _committedQueueView;
++    _acceptedQueuedMessages = new WeakSet();
++    _pendingEnqueues = new Map();
++    _pendingQueueTake;
++    _pendingDirectPromptAdmission;
++    _pendingQueueClear;
+     _resourceLoader;
++    _sessionEvents;
+     _customTools;
+     _baseToolDefinitions = new Map();
+     _cwd;
+@@ -153,6 +175,9 @@
+         // Always subscribe to agent events for internal handling
+         // (session persistence, extensions, auto-compaction, retry logic)
+         this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
++        this._sessionEvents = new SessionEvents(this);
++        this.agent.eventConsumer = (mode) => this._sessionEvents.take(mode);
++        this.agent.eventHasItems = () => !this._sessionEvents.paused && this._sessionEvents.hasPending();
+         this._installAgentToolHooks();
+         this._installAgentNextTurnRefresh();
+         this._buildRuntime({
+@@ -296,6 +321,7 @@
+     // =========================================================================
+     /** Emit an event to all listeners */
+     _emit(event) {
++        if (event.type === "compaction_end") queueMicrotask(() => this._sessionEvents?.poke());
+         for (const l of this._eventListeners) {
+             l(event);
+         }
+@@ -306,7 +332,11 @@
+             steering: [...this._steeringMessages],
+             followUp: [...this._followUpMessages],
+         });
+-    }
++        this._sessionEvents?.signal();
++    }
++    getSessionWaitState() { return this._sessionEvents.state(); }
++    postSessionEvent(message) { return this._sessionEvents.post(message); }
++    waitForSessionEvent(timeoutMs, signal) { return this._sessionEvents.wait(timeoutMs, signal); }
+     _getIdleWaitPromise() {
+         if (!this._idleWaitPromise) {
+             this._idleWaitPromise = new Promise((resolve) => {
+@@ -332,15 +362,21 @@
+         }
+         finally {
+             this._resolveIdleWaitIfIdle();
++            this._sessionEvents.settled();
++            this._sessionEvents.poke();
+         }
+     }
+     // Track last assistant message for auto-compaction check
+     _lastAssistantMessage = undefined;
+     /** Internal handler for agent events - shared by subscribe and reconnect */
+     _handleAgentEvent = async (event) => {
+-        // When a user message starts, check if it's from either queue and remove it BEFORE emitting
+-        // This ensures the UI sees the updated queue state
+-        if (event.type === "message_start" && event.message.role === "user") {
++        if (event.type === "generation_context") {
++            await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "generation_context", model: event.model, reasoning: event.reasoning, context: event.context });
++            return;
++        }
++        // Unmanaged Pi keeps its original local queue display behavior. Managed
++        // queue updates are driven by committed queue transaction receipts.
++        if (!this._managedQueueActive && event.type === "message_start" && event.message.role === "user") {
+             this._overflowRecoveryAttempted = false;
+             const messageText = contentText(event.message.content, "");
+             if (messageText) {
+@@ -361,15 +397,27 @@
+             }
+         }
+         // Emit to extensions first
+-        await this._emitExtensionEvent(event);
++        const acceptedFromQueue = event.type === "message_end" && this._acceptedQueuedMessages.has(event.message);
++        if (!acceptedFromQueue) await this._emitExtensionEvent(event);
++        if (event.type === "message_end" && !acceptedFromQueue) {
++            // Commit the final extension-transformed message before notifying UI
++            // listeners or appending it to the local SessionManager projection.
++            await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "message", message: event.message });
++        }
++        if (event.type === "message_end" && this._pendingDirectPromptAdmission?.message === event.message) {
++            this._pendingDirectPromptAdmission.callback(true);
++            this._pendingDirectPromptAdmission = undefined;
++        }
+         // Notify all listeners
+         this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+         // Handle session persistence
+         if (event.type === "message_end") {
++            if (acceptedFromQueue) this._acceptedQueuedMessages.delete(event.message);
+             // Check if this is a custom message from extensions
+             if (event.message.role === "custom") {
+                 // Persist as CustomMessageEntry
+                 this.sessionManager.appendCustomMessageEntry(event.message.customType, event.message.content, event.message.display, event.message.details);
++                await this._sessionEvents.consumed(event.message);
+             }
+             else if (event.message.role === "user" ||
+                 event.message.role === "assistant" ||
+@@ -554,6 +602,7 @@
+      * Call this when completely done with the session.
+      */
+     dispose() {
++        this._sessionEvents.dispose();
+         try {
+             this.abortRetry();
+             this.abortCompaction();
+@@ -741,13 +790,18 @@
+     // =========================================================================
+     // Prompting
+     // =========================================================================
+-    async _runAgentPrompt(messages) {
++    async _runAgentPrompt(messages, committedQueueLane) {
+         this._isAgentRunActive = true;
+         try {
+-            await this.agent.prompt(messages);
++            if (committedQueueLane) await this.agent.runCommittedQueueMessages(messages, committedQueueLane);
++            else await this.agent.prompt(messages);
+             while (await this._handlePostAgentRun()) {
+                 await this.agent.continue();
+             }
++        }
++        catch (error) {
++            this._sessionEvents.paused = true;
++            throw error;
+         }
+         finally {
+             this._systemPromptOverride = undefined;
+@@ -756,6 +810,7 @@
+         }
+     }
+     async _handlePostAgentRun() {
++        if (this._sessionEvents.paused) return false;
+         const msg = this._lastAssistantMessage;
+         this._lastAssistantMessage = undefined;
+         if (!msg) {
+@@ -790,10 +845,28 @@
+      * @throws Error if no model selected or no API key available (when not streaming)
+      */
+     async prompt(text, options) {
++        this._sessionEvents.paused = false;
++        if (this._pendingQueueTake) {
++            const error = new Error(`queue take ${this._pendingQueueTake.operationId} awaits confirmation; resume it before a new prompt`);
++            error.code = "STAGE_COMMIT_UNAVAILABLE";
++            options?.preflightResult?.(false);
++            options?.acceptedResult?.(false);
++            throw error;
++        }
+         const expandPromptTemplates = options?.expandPromptTemplates ?? true;
+         const preflightResult = options?.preflightResult;
++        const queueOptions = { ...options, admissionInput: queueAdmissionHash([text, options?.images, options?.streamingBehavior, options?.timestamp]) };
+         let messages;
+         try {
++            if (options?.operationId && this._pendingEnqueues.has(options.operationId)) {
++                const pending = this._pendingEnqueues.get(options.operationId);
++                if (pending.lane === "followUp") await this._queueFollowUp("", undefined, queueOptions);
++                else if (pending.lane === "steer") await this._queueSteer("", undefined, queueOptions);
++                else throw new Error("queue operation ID reused for another lane");
++                preflightResult?.(true);
++                options?.acceptedResult?.(true);
++                return;
++            }
+             // Handle extension commands first (execute immediately, even during streaming)
+             // Extension commands manage their own LLM interaction via pi.sendMessage()
+             if (expandPromptTemplates && text.startsWith("/")) {
+@@ -801,6 +874,7 @@
+                 if (handled) {
+                     // Extension command executed, no prompt to send
+                     preflightResult?.(true);
++                    options?.acceptedResult?.(true);
+                     return;
+                 }
+             }
+@@ -814,6 +888,7 @@
+                 const inputResult = await this._extensionRunner.emitInput(currentText, currentImages, options?.source ?? "interactive", this.isStreaming ? options?.streamingBehavior : undefined);
+                 if (inputResult.action === "handled") {
+                     preflightResult?.(true);
++                    options?.acceptedResult?.(true);
+                     return;
+                 }
+                 if (inputResult.action === "transform") {
+@@ -833,12 +908,13 @@
+                     throw new Error("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
+                 }
+                 if (options.streamingBehavior === "followUp") {
+-                    await this._queueFollowUp(expandedText, currentImages);
++                    await this._queueFollowUp(expandedText, currentImages, queueOptions);
+                 }
+                 else {
+-                    await this._queueSteer(expandedText, currentImages);
++                    await this._queueSteer(expandedText, currentImages, queueOptions);
+                 }
+                 preflightResult?.(true);
++                options?.acceptedResult?.(true);
+                 return;
+             }
+             // Flush any pending bash messages before the new prompt
+@@ -874,13 +950,13 @@
+             messages.push({
+                 role: "user",
+                 content: userContent,
+-                timestamp: Date.now(),
++                timestamp: options?.timestamp ?? Date.now(),
+             });
+             // Inject any pending "nextTurn" messages as context alongside the user message
+-            for (const msg of this._pendingNextTurnMessages) {
+-                messages.push(msg);
+-            }
+-            this._pendingNextTurnMessages = [];
++            if (!this._managedQueueActive) {
++                for (const msg of this._pendingNextTurnMessages) messages.push(msg);
++                this._pendingNextTurnMessages = [];
++            }
+             // Emit before_agent_start extension event
+             const result = await this._extensionRunner.emitBeforeAgentStart(expandedText, currentImages, this._baseSystemPrompt, this._baseSystemPromptOptions);
+             // Add all custom messages from extensions
+@@ -910,13 +986,25 @@
+         }
+         catch (error) {
+             preflightResult?.(false);
++            options?.acceptedResult?.(false);
+             throw error;
+         }
+         if (!messages) {
+             return;
+         }
+         preflightResult?.(true);
+-        await this._runAgentPrompt(messages);
++        if (options?.acceptedResult) {
++            this._pendingDirectPromptAdmission = { message: messages[0], callback: options.acceptedResult };
++        }
++        try {
++            await this._runAgentPrompt(messages);
++        }
++        finally {
++            if (this._pendingDirectPromptAdmission?.message === messages[0]) {
++                this._pendingDirectPromptAdmission.callback(false);
++                this._pendingDirectPromptAdmission = undefined;
++            }
++        }
+     }
+     /**
+      * Try to execute an extension command. Returns true if command was found and executed.
+@@ -983,7 +1071,12 @@
+      * @param images Optional image attachments to include with the message
+      * @throws Error if text is an extension command
+      */
+-    async steer(text, images) {
++    async steer(text, images, options) {
++        const queueOptions = { ...options, admissionInput: queueAdmissionHash([text, images, "steer", options?.timestamp]) };
++        if (options?.operationId && this._pendingEnqueues.has(options.operationId)) {
++            await this._queueSteer("", undefined, queueOptions);
++            return;
++        }
+         // Check for extension commands (cannot be queued)
+         if (text.startsWith("/")) {
+             this._throwIfExtensionCommand(text);
+@@ -991,7 +1084,7 @@
+         // Expand skill commands and prompt templates
+         let expandedText = this._expandSkillCommand(text);
+         expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+-        await this._queueSteer(expandedText, images);
++        await this._queueSteer(expandedText, images, queueOptions);
+     }
+     /**
+      * Queue a follow-up message to be processed after the agent finishes.
+@@ -1000,7 +1093,12 @@
+      * @param images Optional image attachments to include with the message
+      * @throws Error if text is an extension command
+      */
+-    async followUp(text, images) {
++    async followUp(text, images, options) {
++        const queueOptions = { ...options, admissionInput: queueAdmissionHash([text, images, "followUp", options?.timestamp]) };
++        if (options?.operationId && this._pendingEnqueues.has(options.operationId)) {
++            await this._queueFollowUp("", undefined, queueOptions);
++            return;
++        }
+         // Check for extension commands (cannot be queued)
+         if (text.startsWith("/")) {
+             this._throwIfExtensionCommand(text);
+@@ -1008,38 +1106,186 @@
+         // Expand skill commands and prompt templates
+         let expandedText = this._expandSkillCommand(text);
+         expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+-        await this._queueFollowUp(expandedText, images);
++        await this._queueFollowUp(expandedText, images, queueOptions);
+     }
+     /**
+      * Internal: Queue a steering message (already expanded, no extension command check).
+      */
+-    async _queueSteer(text, images) {
+-        this._steeringMessages.push(text);
++    _serializeQueueMutation(task) {
++        const next = this._queueMutationTail.then(task, task);
++        this._queueMutationTail = next.then(() => undefined, () => undefined);
++        return next;
++    }
++    async _readCommittedQueue() {
++        let view;
++        try {
++            view = await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "queue_read" });
++        }
++        catch (cause) {
++            const error = new Error("managed Brain queue view is unavailable", { cause });
++            error.code = "STAGE_COMMIT_UNAVAILABLE";
++            throw error;
++        }
++        if (!view || !Array.isArray(view.steer) || !Array.isArray(view.followUp) || !Array.isArray(view.nextTurn) || !Array.isArray(view.events)) {
++            const error = new Error("managed Brain has no committed queue view");
++            error.code = "STAGE_COMMIT_UNAVAILABLE";
++            throw error;
++        }
++        return view;
++    }
++    async _refreshCommittedQueueView() {
++        const view = await this._readCommittedQueue();
++        this._setCommittedQueueView(view);
++        return view;
++    }
++    _setCommittedQueueView(view) {
++        this._committedQueueView = view;
++        this._steeringMessages = view.steer.filter((item) => item.message.role === "user")
++            .map((item) => contentText(item.message.content, ""));
++        this._followUpMessages = view.followUp.filter((item) => item.message.role === "user")
++            .map((item) => contentText(item.message.content, ""));
+         this._emitQueueUpdate();
+-        const content = [{ type: "text", text }];
+-        if (images) {
+-            content.push(...images);
+-        }
+-        this.agent.steer({
+-            role: "user",
+-            content,
+-            timestamp: Date.now(),
++    }
++    _applyCommittedQueueReceipt(receipt, change, stageId) {
++        if (!receipt || receipt.stageId !== stageId || !Number.isSafeInteger(receipt.head)) {
++            const error = new Error("managed Brain queue transaction has no commit receipt");
++            error.code = "STAGE_COMMIT_UNAVAILABLE";
++            throw error;
++        }
++        const view = structuredClone(this._committedQueueView);
++        if (receipt.head <= view.head) return view;
++        change(view);
++        view.head = receipt.head;
++        this._setCommittedQueueView(view);
++        return view;
++    }
++    async _finalizeQueuedMessage(message) {
++        const replacement = await this._extensionRunner.emitMessageEnd({ type: "message_end", message });
++        const finalMessage = replacement ?? message;
++        if (finalMessage.content == null) return { ...finalMessage, content: [] };
++        return finalMessage;
++    }
++    async _takeQueuedMessages(lane) {
++        try {
++            return await this._serializeQueueMutation(async () => {
++            let pending = this._pendingQueueTake;
++            if (pending && pending.lane !== lane) throw new Error(`queue take ${pending.operationId} awaits confirmation`);
++            if (!pending) {
++                const view = await this._readCommittedQueue();
++                const entries = view[lane];
++                const count = lane === "events" ? eventBatchSize(entries) : lane === "nextTurn" || view.modes[lane] === "all" ? entries.length : Math.min(entries.length, 1);
++                if (count === 0) return [];
++                pending = { lane, entries: entries.slice(0, count),
++                    itemIds: entries.slice(0, count).map((item) => item.itemId), operationId: randomUUID() };
++                this._pendingQueueTake = pending;
++            }
++            const receipt = await this._extensionRunner.emitStageCommit({
++                type: "stage_commit", phase: "queue_take", lane: pending.lane,
++                itemIds: pending.itemIds, operationId: pending.operationId,
++            });
++            if (receipt?.queueEffect?.kind !== "take" || receipt.queueEffect.items.length !== pending.entries.length
++                || receipt.queueEffect.items.some((item, index) => item.itemId !== pending.entries[index].itemId
++                    || queueAdmissionHash(item.message) !== queueAdmissionHash(pending.entries[index].message))) {
++                const error = new Error("queue take receipt does not match selected items");
++                error.code = "STAGE_COMMIT_CONFLICT";
++                throw error;
++            }
++            this._applyCommittedQueueReceipt(receipt, (current) => {
++                current[lane] = current[lane].filter((item) => !pending.itemIds.includes(item.itemId));
++            }, pending.operationId);
++            this._pendingQueueTake = undefined;
++            return receipt.queueEffect.items.map((item) => {
++                const message = item.message;
++                this._acceptedQueuedMessages.add(message);
++                return message;
++            });
++            });
++        }
++        catch (error) {
++            if ((lane === "followUp" || lane === "events") && error?.code === "STAGE_COMMIT_CONFLICT") {
++                this._pendingQueueTake = undefined;
++                const current = await this._readCommittedQueue();
++                if (current.steer.length > 0) return this._takeQueuedMessages("steer");
++            }
++            throw error;
++        }
++    }
++    /** Confirm the original queue_take ID and continue its accepted messages. */
++    async resumePendingQueueTake() {
++        this._sessionEvents.paused = false;
++        const pending = this._pendingQueueTake;
++        if (!pending) return false;
++        if (this.isStreaming) throw new Error("Agent is already processing.");
++        const messages = await this._takeQueuedMessages(pending.lane);
++        if (messages.length === 0) return false;
++        await this._runAgentPrompt(messages, pending.lane);
++        return true;
++    }
++    async _queueSteer(text, images, options) {
++        const operationId = options?.operationId ?? randomUUID();
++        const timestamp = options?.timestamp ?? Date.now();
++        return this._serializeQueueMutation(async () => {
++            const prior = this._pendingEnqueues.get(operationId);
++            const content = [{ type: "text", text }];
++            if (images) {
++                content.push(...images);
++            }
++            const message = {
++                role: "user",
++                content,
++                timestamp,
++            };
++            if (this._managedQueueActive) {
++                if (prior && prior.lane !== "steer") throw new Error("queue operation ID reused for another lane");
++                if (prior && prior.admissionInput !== options?.admissionInput) throw new Error("queue operation ID reused for different input");
++                const finalMessage = prior?.message ?? await this._finalizeQueuedMessage(message);
++                this._pendingEnqueues.set(operationId, { lane: "steer", message: finalMessage, admissionInput: options?.admissionInput });
++                const receipt = await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "queue_enqueue",
++                    lane: "steer", message: finalMessage, operationId });
++                this._applyCommittedQueueReceipt(receipt, (current) => {
++                    current.steer.push({ itemId: operationId, message: finalMessage });
++                }, operationId);
++            }
++            else {
++                this._steeringMessages.push(text);
++                this._emitQueueUpdate();
++                this.agent.steer(message);
++            }
+         });
+     }
+     /**
+      * Internal: Queue a follow-up message (already expanded, no extension command check).
+      */
+-    async _queueFollowUp(text, images) {
+-        this._followUpMessages.push(text);
+-        this._emitQueueUpdate();
+-        const content = [{ type: "text", text }];
+-        if (images) {
+-            content.push(...images);
+-        }
+-        this.agent.followUp({
+-            role: "user",
+-            content,
+-            timestamp: Date.now(),
++    async _queueFollowUp(text, images, options) {
++        const operationId = options?.operationId ?? randomUUID();
++        const timestamp = options?.timestamp ?? Date.now();
++        return this._serializeQueueMutation(async () => {
++            const prior = this._pendingEnqueues.get(operationId);
++            const content = [{ type: "text", text }];
++            if (images) {
++                content.push(...images);
++            }
++            const message = {
++                role: "user",
++                content,
++                timestamp,
++            };
++            if (this._managedQueueActive) {
++                if (prior && prior.lane !== "followUp") throw new Error("queue operation ID reused for another lane");
++                if (prior && prior.admissionInput !== options?.admissionInput) throw new Error("queue operation ID reused for different input");
++                const finalMessage = prior?.message ?? await this._finalizeQueuedMessage(message);
++                this._pendingEnqueues.set(operationId, { lane: "followUp", message: finalMessage, admissionInput: options?.admissionInput });
++                const receipt = await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "queue_enqueue",
++                    lane: "followUp", message: finalMessage, operationId });
++                this._applyCommittedQueueReceipt(receipt, (current) => {
++                    current.followUp.push({ itemId: operationId, message: finalMessage });
++                }, operationId);
++            }
++            else {
++                this._followUpMessages.push(text);
++                this._emitQueueUpdate();
++                this.agent.followUp(message);
++            }
+         });
+     }
+     /**
+@@ -1073,8 +1319,31 @@
+             content: message.content ?? [],
+             display: message.display,
+             details: message.details,
+-            timestamp: Date.now(),
++            timestamp: Number.isSafeInteger(message.details?.deliveryTimestamp)
++                ? message.details.deliveryTimestamp : Date.now(),
+         };
++        const deferredLane = options?.deliverAs === "nextTurn" ? "nextTurn"
++            : this.isStreaming && options?.triggerTurn !== false
++                ? options?.deliverAs === "followUp" ? "followUp" : "steer" : undefined;
++        if (this._managedQueueActive && deferredLane) {
++            const operationId = typeof message.details?.deliveryId === "string"
++                ? `${this.sessionId}:queue:${message.details.deliveryId}` : randomUUID();
++            const admissionInput = queueAdmissionHash([message, options]);
++            await this._serializeQueueMutation(async () => {
++                const prior = this._pendingEnqueues.get(operationId);
++                if (prior && prior.lane !== deferredLane) throw new Error("queue operation ID reused for another lane");
++                if (prior && prior.admissionInput !== admissionInput) throw new Error("queue operation ID reused for different input");
++                const finalMessage = prior?.message ?? await this._finalizeQueuedMessage(appMessage);
++                this._pendingEnqueues.set(operationId, { lane: deferredLane, message: finalMessage, admissionInput });
++                const receipt = await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "queue_enqueue",
++                    lane: deferredLane, message: finalMessage, operationId });
++                this._applyCommittedQueueReceipt(receipt, (current) => {
++                    current[deferredLane].push({ itemId: operationId, message: finalMessage });
++                }, operationId);
++            });
++            return;
++        }
++        await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "external_event", message: appMessage, immediate: options?.triggerTurn === false && options?.deliverAs !== "nextTurn" });
+         if (options?.deliverAs === "nextTurn") {
+             this._pendingNextTurnMessages.push(appMessage);
+         }
+@@ -1131,6 +1400,8 @@
+             streamingBehavior: options?.deliverAs,
+             images,
+             source: "extension",
++            operationId: options?.operationId,
++            timestamp: options?.timestamp,
+         });
+     }
+     /**
+@@ -1139,6 +1410,7 @@
+      * @returns Object with steering and followUp arrays
+      */
+     clearQueue() {
++        rejectUnstagedManagedOperation("queue clear");
+         const steering = [...this._steeringMessages];
+         const followUp = [...this._followUpMessages];
+         this._steeringMessages = [];
+@@ -1147,6 +1419,69 @@
+         this._emitQueueUpdate();
+         return { steering, followUp };
+     }
++    /** Commit cancellation before clearing user inputs from both Pi queues. */
++    async clearQueueCommitted(operationId) {
++        if (this._managedQueueActive) {
++            if (this._pendingQueueClear && operationId && this._pendingQueueClear.operationId !== operationId) {
++                throw new Error(`queue clear ${this._pendingQueueClear.operationId} awaits confirmation`);
++            }
++            const pending = this._pendingQueueClear ?? {
++                operationId: operationId ?? randomUUID(),
++                resume: this.agent.pauseQueuedMessages(),
++            };
++            this._pendingQueueClear = pending;
++            return this._serializeQueueMutation(async () => {
++                const receipt = await this._extensionRunner.emitStageCommit({
++                    type: "stage_commit", phase: "queue_clear", operationId: pending.operationId,
++                });
++                if (receipt?.queueEffect?.kind !== "clear") {
++                    const error = new Error("queue clear has no committed result");
++                    error.code = "STAGE_COMMIT_CONFLICT";
++                    throw error;
++                }
++                this._applyCommittedQueueReceipt(receipt, (current) => {
++                    current.steer = current.steer.filter((item) => item.message.role !== "user");
++                    current.followUp = current.followUp.filter((item) => item.message.role !== "user");
++                }, pending.operationId);
++                this._pendingQueueClear = undefined;
++                pending.resume();
++                return { steering: receipt.queueEffect.steering, followUp: receipt.queueEffect.followUp };
++            });
++        }
++        // Acquire synchronously, before the first await: a running loop must not
++        // drain a queued input while its cancellation is awaiting a receipt.
++        const resumeQueue = this.agent.pauseQueuedMessages();
++        const cleared = await this._serializeQueueMutation(async () => {
++                // An input drained before the lock was acquired is already active,
++                // even if message_start has not updated the UI list yet.
++                const steering = this.agent.steeringQueue.messages
++                    .filter((message) => message.role === "user")
++                    .map((message) => contentText(message.content, ""));
++                const followUp = this.agent.followUpQueue.messages
++                    .filter((message) => message.role === "user")
++                    .map((message) => contentText(message.content, ""));
++                await this._extensionRunner.emitStageCommit({
++                    type: "stage_commit", phase: "context_change",
++                    change: { action: "clear_queue", steering, followUp },
++                });
++                this.agent.steeringQueue.messages = this.agent.steeringQueue.messages.filter((message) => message.role !== "user");
++                this.agent.followUpQueue.messages = this.agent.followUpQueue.messages.filter((message) => message.role !== "user");
++                for (const text of steering) {
++                    const index = this._steeringMessages.indexOf(text);
++                    if (index !== -1) this._steeringMessages.splice(index, 1);
++                }
++                for (const text of followUp) {
++                    const index = this._followUpMessages.indexOf(text);
++                    if (index !== -1) this._followUpMessages.splice(index, 1);
++                }
++                this._emitQueueUpdate();
++                return { steering, followUp };
++        });
++        // A failed/unknown commit leaves this session paused. It must not run
++        // the queued input until the original cancellation stage is resolved.
++        resumeQueue();
++        return cleared;
++    }
+     /** Number of pending messages (includes both steering and follow-up) */
+     get pendingMessageCount() {
+         return this._steeringMessages.length + this._followUpMessages.length;
+@@ -1166,6 +1501,7 @@
+      * Abort current operation and wait for agent to become idle.
+      */
+     async abort() {
++        this._sessionEvents.stop();
+         this.abortRetry();
+         this.agent.abort();
+         await this.waitForIdle();
+@@ -1200,11 +1536,14 @@
+         }
+         const previousModel = this.model;
+         const thinkingLevel = this._getThinkingLevelForModelSwitch();
++        await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "context_change", change: { action: "set_model", model, thinkingLevel } });
+         this.agent.state.model = model;
+         this.sessionManager.appendModelChange(model.provider, model.id);
+         this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+         // Re-clamp thinking level for new model's capabilities
+-        this.setThinkingLevel(thinkingLevel);
++        this._applyingCommittedModelStage = true;
++        try { this.setThinkingLevel(thinkingLevel); }
++        finally { this._applyingCommittedModelStage = false; }
+         await this._emitModelSelect(model, previousModel, "set");
+     }
+     /**
+@@ -1232,6 +1571,7 @@
+         const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
+         const next = scopedModels[nextIndex];
+         const thinkingLevel = this._getThinkingLevelForModelSwitch(next.thinkingLevel);
++        await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "context_change", change: { action: "cycle_model", model: next.model, thinkingLevel } });
+         // Apply model
+         this.agent.state.model = next.model;
+         this.sessionManager.appendModelChange(next.model.provider, next.model.id);
+@@ -1240,7 +1580,9 @@
+         // - Explicit scoped model thinking level overrides current session level
+         // - Undefined scoped model thinking level inherits the current session preference
+         // setThinkingLevel clamps to model capabilities.
+-        this.setThinkingLevel(thinkingLevel);
++        this._applyingCommittedModelStage = true;
++        try { this.setThinkingLevel(thinkingLevel); }
++        finally { this._applyingCommittedModelStage = false; }
+         await this._emitModelSelect(next.model, currentModel, "cycle");
+         return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
+     }
+@@ -1256,11 +1598,14 @@
+         const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
+         const nextModel = availableModels[nextIndex];
+         const thinkingLevel = this._getThinkingLevelForModelSwitch();
++        await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "context_change", change: { action: "cycle_model", model: nextModel, thinkingLevel } });
+         this.agent.state.model = nextModel;
+         this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+         this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
+         // Re-clamp thinking level for new model's capabilities
+-        this.setThinkingLevel(thinkingLevel);
++        this._applyingCommittedModelStage = true;
++        try { this.setThinkingLevel(thinkingLevel); }
++        finally { this._applyingCommittedModelStage = false; }
+         await this._emitModelSelect(nextModel, currentModel, "cycle");
+         return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
+     }
+@@ -1273,6 +1618,7 @@
+      * Saves to session and settings only if the level actually changes.
+      */
+     setThinkingLevel(level) {
++        if (!this._applyingCommittedModelStage) rejectUnstagedManagedOperation("thinking level change");
+         const availableLevels = this.getAvailableThinkingLevels();
+         const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
+         // Only persist if actually changing
+@@ -1337,6 +1683,7 @@
+     // Queue Mode Management
+     // =========================================================================
+     syncQueueModesFromSettings() {
++        if (this._managedQueueActive) throw new Error("managed Brain: queue mode needs committed update");
+         this.agent.steeringMode = this.settingsManager.getSteeringMode();
+         this.agent.followUpMode = this.settingsManager.getFollowUpMode();
+     }
+@@ -1345,6 +1692,7 @@
+      * Saves to settings.
+      */
+     setSteeringMode(mode) {
++        if (this._managedQueueActive) throw new Error("managed Brain: use setSteeringModeCommitted");
+         this.agent.steeringMode = mode;
+         this.settingsManager.setSteeringMode(mode);
+     }
+@@ -1353,8 +1701,51 @@
+      * Saves to settings.
+      */
+     setFollowUpMode(mode) {
++        if (this._managedQueueActive) throw new Error("managed Brain: use setFollowUpModeCommitted");
+         this.agent.followUpMode = mode;
+         this.settingsManager.setFollowUpMode(mode);
++    }
++    async _setQueueModeCommitted(lane, mode, operationId = randomUUID()) {
++        if (!this._managedQueueActive) {
++            if (lane === "steer") this.setSteeringMode(mode);
++            else this.setFollowUpMode(mode);
++            return;
++        }
++        await this._serializeQueueMutation(async () => {
++            const receipt = await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "queue_mode", lane, mode, operationId });
++            const view = this._applyCommittedQueueReceipt(receipt, (current) => {
++                current.modes[lane] = mode;
++                current.modesInitialized[lane] = true;
++            }, operationId);
++            this.agent.steeringMode = view.modes.steer;
++            this.agent.followUpMode = view.modes.followUp;
++            if (lane === "steer") this.settingsManager.setSteeringMode(view.modes.steer);
++            else this.settingsManager.setFollowUpMode(view.modes.followUp);
++        });
++    }
++    async setSteeringModeCommitted(mode, operationId) {
++        await this._setQueueModeCommitted("steer", mode, operationId);
++    }
++    async setFollowUpModeCommitted(mode, operationId) {
++        await this._setQueueModeCommitted("followUp", mode, operationId);
++    }
++    async _bindManagedQueue() {
++        if (!this._extensionRunner.hasHandlers("stage_commit")) return;
++        let view = await this._readCommittedQueue();
++        for (const lane of ["steer", "followUp"]) {
++            if (!view.modesInitialized[lane]) {
++                const mode = lane === "steer" ? this.agent.steeringMode : this.agent.followUpMode;
++                await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "queue_mode", lane, mode,
++                    operationId: `${this.sessionId}:queue-mode:${lane}:init` });
++                view = await this._readCommittedQueue();
++            }
++        }
++        this.agent.steeringMode = view.modes.steer;
++        this.agent.followUpMode = view.modes.followUp;
++        this.agent.queueConsumer = (lane) => this._takeQueuedMessages(lane);
++        this.agent.queueHasItems = () => Boolean(this._committedQueueView?.steer.length || this._committedQueueView?.followUp.length);
++        this._managedQueueActive = true;
++        await this._refreshCommittedQueueView();
+     }
+     // =========================================================================
+     // Compaction
+@@ -1365,6 +1756,7 @@
+      * @param customInstructions Optional instructions for the compaction summary
+      */
+     async compact(customInstructions) {
++        rejectUnstagedManagedOperation("compaction");
+         await this.abort();
+         this._compactionAbortController = new AbortController();
+         this._emit({ type: "compaction_start", reason: "manual" });
+@@ -1593,6 +1985,7 @@
+      * Internal: Run auto-compaction with events.
+      */
+     async _runAutoCompaction(reason, willRetry) {
++        rejectUnstagedManagedOperation("automatic compaction");
+         const settings = this.settingsManager.getCompactionSettings();
+         let started = false;
+         try {
+@@ -1758,8 +2151,11 @@
+             this._extensionErrorListener = bindings.onError;
+         }
+         this._applyExtensionBindings(this._extensionRunner);
++        await this._bindManagedQueue();
+         await this._extensionRunner.emit(this._sessionStartEvent);
+         await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
++        await this._sessionEvents.migrate();
++        this._sessionEvents.markReady();
+     }
+     async extendResourcesFromExtensions(reason) {
+         if (!this._extensionRunner.hasHandlers("resources_discover")) {
+@@ -1843,22 +2239,26 @@
+             return [...extensionCommands, ...templates, ...skills];
+         };
+         runner.bindCore({
++            postEvent: (message) => this.postSessionEvent(message),
++            waitForSessionEvent: (timeoutMs, signal) => this.waitForSessionEvent(timeoutMs, signal),
+             sendMessage: (message, options) => {
+-                this.sendCustomMessage(message, options).catch((err) => {
++                return this.sendCustomMessage(message, options).catch((err) => {
+                     runner.emitError({
+                         extensionPath: "<runtime>",
+                         event: "send_message",
+                         error: err instanceof Error ? err.message : String(err),
+                     });
++                    throw err;
+                 });
+             },
+             sendUserMessage: (content, options) => {
+-                this.sendUserMessage(content, options).catch((err) => {
++                return this.sendUserMessage(content, options).catch((err) => {
+                     runner.emitError({
+                         extensionPath: "<runtime>",
+                         event: "send_user_message",
+                         error: err instanceof Error ? err.message : String(err),
+                     });
++                    throw err;
+                 });
+             },
+             appendEntry: (customType, data) => {
+@@ -2050,6 +2450,10 @@
+         });
+     }
+     async reload(options) {
++        if (this._managedQueueActive) throw new Error("managed Brain: extension reload has no stage barrier");
++        this._sessionEvents.suspend();
++        await this.abort();
++        this._sessionEvents.restoreLocal();
+         const oldRunner = this._extensionRunner;
+         const previousFlagValues = oldRunner.getFlagValues();
+         await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
+@@ -2072,6 +2476,8 @@
+             await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
+             await this.extendResourcesFromExtensions("reload");
+         }
++        await this._sessionEvents.migrate();
++        this._sessionEvents.markReady();
+     }
+     // =========================================================================
+     // Auto-Retry
+@@ -2197,6 +2603,7 @@
+      * @param options.operations Custom BashOperations for remote execution
+      */
+     async executeBash(command, onChunk, options) {
++        rejectUnstagedManagedOperation("direct bash execution");
+         const abortController = new AbortController();
+         this._bashAbortControllers.add(abortController);
+         // Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
+@@ -2216,6 +2623,7 @@
+         }
+         finally {
+             this._bashAbortControllers.delete(abortController);
++            this._sessionEvents.poke();
+         }
+     }
+     /**
+@@ -2223,6 +2631,7 @@
+      * Used by executeBash and by extensions that handle bash execution themselves.
+      */
+     recordBashResult(command, result, options) {
++        rejectUnstagedManagedOperation("direct bash result recording");
+         const bashMessage = {
+             role: "bashExecution",
+             command,
+@@ -2304,6 +2713,7 @@
+      * @returns Result with editorText (if user message) and cancelled status
+      */
+     async navigateTree(targetId, options = {}) {
++        rejectUnstagedManagedOperation("session tree navigation");
+         if (this.isStreaming) {
+             throw new Error("Wait for the current response to finish before navigating the session tree.");
+         }
+@@ -2684,4 +3094,4 @@
+         return this._extensionRunner;
+     }
+ }
+-//# sourceMappingURL=agent-session.js.map
+\ No newline at end of file
++//# sourceMappingURL=agent-session.js.map
