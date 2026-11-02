@@ -7,6 +7,11 @@
 // Call sites previously repeated the same 5-line fetch block 13× in
 // hooks/useAgentSession.ts. This helper collapses that down to one line.
 
+export class AgentCommandError extends Error {
+  readonly code?: string;
+  constructor(message: string, code?: string) { super(message); this.code = code; }
+}
+
 export async function sendAgentCommand<T = unknown>(
   sessionId: string,
   command: Record<string, unknown>,
@@ -19,9 +24,9 @@ export async function sendAgentCommand<T = unknown>(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(command),
   });
-  const body = (await res.json().catch(() => ({}))) as { success?: boolean; data?: T; error?: string };
+  const body = (await res.json().catch(() => ({}))) as { success?: boolean; data?: T; error?: string; code?: string };
   if (!res.ok || body.error) {
-    throw new Error(body.error ?? `HTTP ${res.status}`);
+    throw new AgentCommandError(body.error ?? `HTTP ${res.status}`, body.code);
   }
   return body.data as T;
 }

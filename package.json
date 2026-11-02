@@ -36,7 +36,7 @@
     "start": "next start -H 127.0.0.1 -p 30141",
     "start:lan": "next start -H 0.0.0.0 -p 30141",
     "lint": "eslint .",
-    "test": "node --experimental-strip-types --test lib/agent-client.test.mjs lib/markdown.test.mjs lib/message-display.test.mjs lib/stream-state.test.mjs lib/prompt-admission.test.mjs lib/rpc-manager-admission.test.mjs hooks/useAgentSession.test.mjs components/ChatWindow.grouping.test.mjs components/MessageView.test.mjs",
+    "test": "node --experimental-strip-types --test lib/agent-client.test.mjs lib/markdown.test.mjs lib/message-display.test.mjs lib/stream-state.test.mjs lib/prompt-admission.test.mjs lib/rpc-manager-admission.test.mjs lib/queue-state.test.mjs lib/queue-recall.test.mjs lib/queue-recall-rpc.test.mjs lib/queue-routes.test.mjs lib/draft-store.test.mjs hooks/useAgentSession.test.mjs components/ChatInput.draft.test.mjs components/ChatWindow.grouping.test.mjs components/MessageView.test.mjs",
     "release": "npm version patch --no-git-tag-version && npm run build && npm publish --access public"
   },
   "dependencies": {

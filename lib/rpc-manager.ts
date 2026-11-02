@@ -11,6 +11,7 @@ import { cacheSessionPath, invalidateSessionListCache } from "./session-reader";
 import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
 import { persistExplicitStartupPreferences } from "./startup-preferences";
 import { waitForQueuedPromptAdmission } from "./prompt-admission";
+import type { QueueSnapshot, RecallReceipt } from "./queue-state";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
 import type { ExtensionUiRequest, ExtensionUiResponse, ExtensionWidgetItem } from "./types";
@@ -26,6 +27,17 @@ export interface AgentEvent {
 }
 
 type EventListener = (event: AgentEvent) => void;
+type RecallOperation = {
+  fingerprint: string;
+  state: "pending" | "succeeded" | "retryable-managed" | "unknown";
+  promise?: Promise<RecallReceipt>;
+  receipt?: RecallReceipt;
+  error?: Error;
+};
+
+function recallError(code: string, message: string): Error & { code: string } {
+  return Object.assign(new Error(message), { code });
+}
 
 type PendingUiResponse = {
   resolve: (response: ExtensionUiResponse) => void;
@@ -136,6 +148,9 @@ function withExtensionTools(session: AgentSessionLike, toolNames: string[]): str
 // ============================================================================
 
 export class AgentSessionWrapper {
+  private readonly runtimeId = randomUUID();
+  private queueSnapshot: QueueSnapshot | null = null;
+  private recallOperations = new Map<string, RecallOperation>();
   private listeners: EventListener[] = [];
   private pendingUiResponses = new Map<string, PendingUiResponse>();
   private pendingUiRequests = new Map<string, AgentEvent>();
@@ -175,16 +190,69 @@ export class AgentSessionWrapper {
   }
 
   isRunning(): boolean {
-    return this._alive && (this.promptRunning || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning);
+    return this._alive && (this.promptRunning || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning
+      || [...this.recallOperations.values()].some(operation => operation.state === "pending" || operation.state === "retryable-managed"));
+  }
+
+  getQueueSnapshot(force = false): QueueSnapshot {
+    const steering = [...(this.inner.getSteeringMessages?.() ?? [])];
+    const followUp = [...(this.inner.getFollowUpMessages?.() ?? [])];
+    const previous = this.queueSnapshot;
+    if (force || !previous || JSON.stringify([previous.steering, previous.followUp]) !== JSON.stringify([steering, followUp])) {
+      this.queueSnapshot = Object.freeze({ sessionId: this.sessionId, runtimeId: this.runtimeId,
+        revision: previous ? previous.revision + 1 : 0,
+        steering: Object.freeze(steering), followUp: Object.freeze(followUp) });
+    }
+    return this.queueSnapshot!;
+  }
+
+  private clearQueue(command: Record<string, unknown>): Promise<RecallReceipt | { steering: string[]; followUp: string[] }> {
+    if (command.expectedRuntimeId !== undefined && command.expectedRuntimeId !== this.runtimeId) {
+      return Promise.reject(recallError("QUEUE_INSTANCE_CHANGED", "Queue runtime changed; the previous recall was not executed again"));
+    }
+    const operationId = command.operationId;
+    // Existing callers retain the original response shape and no retry promise.
+    if (typeof operationId !== "string" || !operationId) return this.inner.clearQueueCommitted();
+    const fingerprint = JSON.stringify([command.timestamp, command.expectedRuntimeId]);
+    let operation = this.recallOperations.get(operationId);
+    if (operation && operation.fingerprint !== fingerprint) return Promise.reject(recallError("QUEUE_OPERATION_CONFLICT", "Recall operation ID reused with different input"));
+    if (operation?.state === "pending") return operation.promise!;
+    if (operation?.state === "succeeded") return Promise.resolve(operation.receipt!);
+    if (operation?.state === "unknown") return Promise.reject(operation.error);
+    if (!operation) {
+      operation = { fingerprint, state: "pending" };
+      this.recallOperations.set(operationId, operation);
+    }
+    const current = operation;
+    current.state = "pending";
+    const promise = Promise.resolve().then(() => this.inner.clearQueueCommitted(operationId)).then(result => {
+      const receipt: RecallReceipt = { operationId, steering: [...result.steering], followUp: [...result.followUp], queue: this.getQueueSnapshot() };
+      current.receipt = receipt;
+      current.state = "succeeded";
+      return receipt;
+    }).catch(error => {
+      const managed = (this.inner as unknown as { _managedQueueActive?: boolean })._managedQueueActive === true;
+      if (managed && error?.code === "STAGE_COMMIT_UNAVAILABLE") {
+        current.state = "retryable-managed";
+        current.error = recallError("QUEUE_RECALL_RETRYABLE", "Queue commit is unconfirmed; retry only this original recall operation");
+      } else {
+        current.state = "unknown";
+        current.error = recallError("QUEUE_RECALL_UNKNOWN", `Recall outcome is unknown and will not be executed again: ${String(error)}`);
+      }
+      throw current.error;
+    }).finally(() => { this.resetIdleTimer(); });
+    current.promise = promise;
+    return promise;
   }
 
   start(): void {
+    this.getQueueSnapshot();
     this.unsubscribe = this.inner.subscribe((event: AgentEvent) => {
       if (event.type === "agent_end") {
         invalidateSessionListCache();
       }
       if (IDLE_RESET_EVENT_TYPES.has(event.type)) this.resetIdleTimer();
-      this.emit(event);
+      this.emit(event.type === "queue_update" ? { ...event, queue: this.getQueueSnapshot(true) } : event);
       if (RUNNING_STATE_EVENT_TYPES.has(event.type)) notifyRunningChange();
     });
     this.resetIdleTimer();
@@ -291,7 +359,15 @@ export class AgentSessionWrapper {
   }
 
   private emit(event: AgentEvent): void {
-    for (const l of this.listeners) l(event);
+    for (const listener of [...this.listeners]) {
+      try { listener(event); }
+      catch {
+        // A broken browser connection cannot turn an accepted SDK operation
+        // into an error or prevent other subscribers from receiving it.
+        const index = this.listeners.indexOf(listener);
+        if (index !== -1) this.listeners.splice(index, 1);
+      }
+    }
   }
 
   private resetIdleTimer(): void {
@@ -487,6 +563,7 @@ export class AgentSessionWrapper {
       case "get_state": {
         const model = this.inner.model;
         const contextUsage = this.inner.getContextUsage();
+        const queue = this.getQueueSnapshot();
         return {
           sessionId: this.inner.sessionId,
           sessionFile: this.inner.sessionFile ?? "",
@@ -501,9 +578,10 @@ export class AgentSessionWrapper {
           messageCount: 0,
           pendingMessageCount: this.inner.pendingMessageCount,
           queuedMessages: {
-            steering: [...this.inner.getSteeringMessages()],
-            followUp: [...this.inner.getFollowUpMessages()],
+            steering: [...queue.steering],
+            followUp: [...queue.followUp],
           },
+          queue,
           contextUsage: contextUsage
             ? { percent: contextUsage.percent, contextWindow: contextUsage.contextWindow, tokens: contextUsage.tokens }
             : null,
@@ -622,7 +700,7 @@ export class AgentSessionWrapper {
 
       case "clear_queue": {
         // Commit cancellation before changing Pi's queued user inputs.
-        return await this.inner.clearQueueCommitted(command.operationId as string | undefined);
+        return await this.clearQueue(command);
       }
 
       case "steer": {

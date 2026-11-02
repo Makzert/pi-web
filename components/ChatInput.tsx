@@ -1,10 +1,10 @@
 "use client";
 
-import React, { useRef, useState, useCallback, useEffect, useImperativeHandle, forwardRef, KeyboardEvent } from "react";
+import React, { useRef, useState, useCallback, useEffect, useLayoutEffect, useImperativeHandle, useSyncExternalStore, useMemo, useId, forwardRef, KeyboardEvent } from "react";
 import type { BuiltinSlashCommandResult, CompactResultInfo, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { SkillsResponse } from "@/lib/api-types";
 import type { TextContent, UserMessage } from "@/lib/types";
-import { clearDraft, getDraft, setDraft, type ChatDraftImage } from "@/lib/draft-store";
+import { clearDraft, getDraftSnapshot, subscribeDraft, updateDraft, promoteDraft, EMPTY_DRAFT, type ChatDraftImage } from "@/lib/draft-store";
 import {
   MAX_ATTACHED_IMAGE_BYTES,
   MAX_ATTACHED_IMAGES,
@@ -359,16 +359,39 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
 }: Props, ref) {
   const { t } = useI18n();
   const isMobile = useIsMobile();
-  const [value, setValue] = useState(() => (draftKey ? getDraft(draftKey)?.value ?? "" : ""));
+  const localDraftKey = useId();
+  const storeKey = draftKey ?? localDraftKey;
+  const bindingRef = useRef({ key: storeKey });
+  const previousBinding = bindingRef.current;
+  const promoting = previousBinding.key.startsWith("new:") && !storeKey.startsWith("new:");
+  if (previousBinding.key !== storeKey && !promoting) bindingRef.current = { key: storeKey };
+  const binding = bindingRef.current;
+  useLayoutEffect(() => {
+    if (binding.key === storeKey) return;
+    const from = binding.key;
+    // In-flight image readers keep this editor binding and follow promotion.
+    // A later new chat at the same cwd gets a separate binding and draft.
+    binding.key = storeKey;
+    promoteDraft(from, storeKey);
+  }, [binding, storeKey]);
+  const subscribe = useCallback((listener: () => void) => subscribeDraft(storeKey, listener), [storeKey]);
+  const readDraft = useCallback(() => getDraftSnapshot(storeKey), [storeKey]);
+  const draft = useSyncExternalStore(subscribe, readDraft, () => EMPTY_DRAFT);
+  const value = draft.value;
+  const setValue = useCallback((update: React.SetStateAction<string>) => {
+    updateDraft(binding.key, current => ({ ...current, value: typeof update === "function" ? update(current.value) : update }));
+  }, [binding]);
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const [modelDropdownRect, setModelDropdownRect] = useState<{ top: number; left: number; width: number } | null>(null);
   const [modelFilter, setModelFilter] = useState("");
   const [toolDropdownOpen, setToolDropdownOpen] = useState(false);
   const [thinkingDropdownOpen, setThinkingDropdownOpen] = useState(false);
   const [controlsMenuOpen, setControlsMenuOpen] = useState(false);
-  const [attachedImages, setAttachedImages] = useState<AttachedImage[]>(() => (
-    draftKey ? draftImagesToAttachedImages(getDraft(draftKey)?.images) : []
-  ));
+  const attachedImages = useMemo(() => draftImagesToAttachedImages(draft.images), [draft.images]);
+  const setAttachedImages = useCallback((update: React.SetStateAction<AttachedImage[]>) => {
+    updateDraft(binding.key, current => ({ ...current, images: (typeof update === "function"
+      ? update(draftImagesToAttachedImages(current.images)) : update).map(imageToDraftImage) }));
+  }, [binding]);
   const trimmedValue = value.trimStart();
   const bashMode = attachedImages.length === 0 && trimmedValue.startsWith("!");
   const bashExcluded = bashMode && trimmedValue.startsWith("!!");
@@ -406,11 +429,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const historyItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const fileIndexMetaRef = useRef<{ cwd: string; fetchedAt: number } | null>(null);
   const fileIndexFetchingRef = useRef<string | null>(null);
-  const draftKeyRef = useRef(draftKey);
-  const valueRef = useRef(value);
   const attachedImagesRef = useRef(attachedImages);
   const pendingImageCountRef = useRef(0);
-  valueRef.current = value;
   attachedImagesRef.current = attachedImages;
 
   useImperativeHandle(ref, () => ({
@@ -512,7 +532,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 const result = reader.result as string;
                 // result is "data:<mime>;base64,<data>"
                 const base64 = result.split(",")[1];
-                resolve({ data: base64, mimeType: file.type, previewUrl: URL.createObjectURL(file) });
+                resolve(draftImageToAttachedImage({ data: base64, mimeType: file.type }));
               };
               reader.onerror = reject;
               reader.readAsDataURL(file);
@@ -527,7 +547,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     } finally {
       pendingImageCountRef.current -= imageFiles.length;
     }
-  }, [isStreaming]);
+  }, [isStreaming, setAttachedImages]);
 
   const removeImage = useCallback((index: number) => {
     setAttachedImages((prev) => {
@@ -536,56 +556,21 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       if (removed) revokeImagePreview(removed);
       return next;
     });
-  }, []);
-
-  const clearImages = useCallback(() => {
-    setAttachedImages((prev) => {
-      prev.forEach(revokeImagePreview);
-      return [];
-    });
-  }, []);
+  }, [setAttachedImages]);
 
   const clearInput = useCallback(() => {
-    setValue("");
+    clearDraft(binding.key);
     setAtQuery(null);
     setHistoryMenuOpen(false);
-    if (draftKey) clearDraft(draftKey);
-    if (draftKeyRef.current && draftKeyRef.current !== draftKey) clearDraft(draftKeyRef.current);
-    clearImages();
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
-  }, [clearImages, draftKey]);
+  }, [binding]);
 
   useEffect(() => {
-    if (!draftKey || draftKeyRef.current !== draftKey) return;
-    setDraft(draftKey, {
-      value,
-      images: attachedImages.map(imageToDraftImage),
-    });
-  }, [attachedImages, draftKey, value]);
-
-  useEffect(() => {
-    const previousDraftKey = draftKeyRef.current;
-    if (previousDraftKey === draftKey) return;
-
-    if (previousDraftKey) {
-      setDraft(previousDraftKey, {
-        value: valueRef.current,
-        images: attachedImagesRef.current.map(imageToDraftImage),
-      });
-    }
-
-    const draft = draftKey ? getDraft(draftKey) : null;
-    draftKeyRef.current = draftKey;
-    setValue(draft?.value ?? "");
     setAtQuery(null);
     setHistoryMenuOpen(false);
-    setAttachedImages((prev) => {
-      prev.forEach(revokeImagePreview);
-      return draftImagesToAttachedImages(draft?.images);
-    });
-  }, [draftKey]);
+  }, [storeKey]);
 
   useEffect(() => {
     const ta = textareaRef.current;
@@ -768,7 +753,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       el.style.height = "auto";
       el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
     });
-  }, [atQuery, value]);
+  }, [atQuery, value, setValue]);
 
   useEffect(() => {
     if (atActiveIndex >= atMatches.length) {
@@ -813,7 +798,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       ta.style.height = "auto";
       ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
     });
-  }, []);
+  }, [setValue]);
 
   const applySlashCommand = useCallback((command: SlashCommandPaletteItem) => {
     const nextValue = `/${command.name} `;
@@ -828,7 +813,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       ta.style.height = "auto";
       ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
     });
-  }, []);
+  }, [setValue]);
 
   const sendQueued = useCallback((mode: "steer" | "followup") => {
     const msg = value.trim();

@@ -11,6 +11,8 @@ import type {
 } from "@/lib/types";
 import { normalizeToolCalls } from "@/lib/normalize";
 import { sendAgentCommand } from "@/lib/agent-client";
+import { QueueSnapshotTracker, type QueueReadTicket } from "@/lib/queue-state";
+import { recallQueue, getRecallFailure, abandonUnknownRecall } from "@/lib/queue-recall";
 import { getToolNamesForPreset, type ToolEntry } from "@/lib/tool-presets";
 import { streamReducer } from "@/lib/stream-state";
 import type { SessionStatsInfo } from "@/lib/pi-types";
@@ -61,15 +63,12 @@ type AgentStateResponse = {
   extensionStatuses?: ExtensionStatusItem[];
   extensionWidgets?: ExtensionWidgetItem[];
   queuedMessages?: { steering?: string[]; followUp?: string[] } | null;
+  queue?: unknown;
 };
 
 export interface QueuedMessages {
   steering: string[];
   followUp: string[];
-}
-
-function normalizeQueuedMessages(q?: { steering?: string[]; followUp?: string[] } | null): QueuedMessages {
-  return { steering: q?.steering ?? [], followUp: q?.followUp ?? [] };
 }
 
 type ExtensionUiDialogRequest = Extract<ExtensionUiRequest, { method: "select" | "confirm" | "input" | "editor" }>;
@@ -406,7 +405,35 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const backgroundSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionRevisionRef = useRef<SessionRevision | null>(null);
   const pendingQueueInputsRef = useRef(new Map<string, { operationId: string; timestamp: number }>());
-  const pendingRecallOperationRef = useRef<{ sessionId: string; operationId: string; timestamp: number } | null>(null);
+  const queueTrackerRef = useRef<QueueSnapshotTracker | null>(null);
+  const queueViewEpochRef = useRef(0);
+  const queueViewAliveRef = useRef(true);
+  useEffect(() => {
+    const epochRef = queueViewEpochRef;
+    queueViewAliveRef.current = true;
+    return () => { queueViewAliveRef.current = false; epochRef.current++; };
+  }, []);
+  const queueTracker = useCallback((sid: string) => {
+    if (queueTrackerRef.current?.sessionId !== sid) queueTrackerRef.current = new QueueSnapshotTracker(sid);
+    return queueTrackerRef.current;
+  }, []);
+  const captureQueueRead = useCallback((sid: string) => ({
+    tracker: queueTracker(sid), ticket: queueTracker(sid).capture(), epoch: queueViewEpochRef.current,
+  }), [queueTracker]);
+  const applyQueueSnapshot = useCallback((value: unknown, authoritative = false, ticket?: QueueReadTicket) => {
+    const sid = sessionIdRef.current;
+    if (!sid || !queueViewAliveRef.current) return;
+    const tracker = queueTracker(sid);
+    if (tracker.accept(value, authoritative, ticket) && tracker.snapshot) {
+      setQueuedMessages({ steering: [...tracker.snapshot.steering], followUp: [...tracker.snapshot.followUp] });
+    }
+  }, [queueTracker]);
+  const applyQueueRead = useCallback((read: ReturnType<typeof captureQueueRead>, state?: AgentStateResponse, running = true) => {
+    if (!queueViewAliveRef.current || read.epoch !== queueViewEpochRef.current || sessionIdRef.current !== read.tracker.sessionId) return;
+    if (state?.queue) applyQueueSnapshot(state.queue, true, read.ticket);
+    else if (!running && read.tracker.absent(read.ticket)) setQueuedMessages({ steering: [], followUp: [] });
+    // Unversioned state never overwrites the ordered queue view.
+  }, [applyQueueSnapshot]);
 
   const setToolPresetState = opts.setToolPreset ?? setToolPreset;
 
@@ -519,6 +546,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!includeState) return null;
 
       try {
+        const queueRead = captureQueueRead(sid);
         const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`);
         if (!stateRes.ok) throw new Error(`HTTP ${stateRes.status}`);
         const agentState = await stateRes.json() as { running: boolean; state?: AgentStateResponse };
@@ -531,11 +559,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (liveState.thinkingLevel !== undefined) setThinkingLevel((liveState.thinkingLevel as ThinkingLevelOption) ?? "auto");
           if (liveState.extensionStatuses !== undefined) setExtensionStatuses(liveState.extensionStatuses ?? []);
           if (liveState.extensionWidgets !== undefined) setExtensionWidgets(liveState.extensionWidgets ?? []);
-          if (liveState.queuedMessages !== undefined) setQueuedMessages(normalizeQueuedMessages(liveState.queuedMessages));
           if (liveState.sessionWait) setAgentPhase({ kind: "waiting_event", ...liveState.sessionWait });
-        } else if (!agentState.running) {
-          setQueuedMessages({ steering: [], followUp: [] });
         }
+        applyQueueRead(queueRead, liveState, agentState.running);
         return agentState;
       } catch (e) {
         console.error("Failed to load agent state:", e);
@@ -547,7 +573,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } finally {
       if (showLoading && !messagesLoaded) setLoading(false);
     }
-  }, []);
+  }, [applyQueueRead, captureQueueRead]);
 
   const loadContext = useCallback(async (sid: string, leafId: string | null) => {
     try {
@@ -703,9 +729,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const timeout = setTimeout(() => settle("timeout"), EVENT_STREAM_CONNECT_TIMEOUT_MS);
 
       es.onmessage = (e) => {
+        if (eventSourceRef.current !== es || !queueViewAliveRef.current) return;
         try {
           const event = JSON.parse(e.data) as AgentEvent;
-          if (event.type === "connected") settle("connected");
+          if (event.type === "connected") {
+            applyQueueSnapshot(event.queue, true);
+            settle("connected");
+          }
           handleAgentEventRef.current?.(event);
         } catch {
           // ignore
@@ -740,7 +770,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     });
     eventConnectionAttemptRef.current = { source: es, promise, pending: true };
     return promise;
-  }, [closeEvents]);
+  }, [closeEvents, applyQueueSnapshot]);
 
   const ensureEventsConnected = useCallback(async (sid: string) => {
     const current = eventSourceRef.current;
@@ -1080,6 +1110,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const reconcileAgentState = useCallback(async (sid: string) => {
     if (!agentRunningRef.current) return;
     const runId = promptRunIdRef.current;
+    const queueRead = captureQueueRead(sid);
     try {
       const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
       if (!res.ok) return;
@@ -1093,7 +1124,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // would otherwise leave the "Stop compaction" UI stuck. No state
       // (wrapper destroyed) means nothing is compacting.
       setIsCompacting(state?.isCompacting ?? false);
-      setQueuedMessages(normalizeQueuedMessages(state?.queuedMessages));
+      applyQueueRead(queueRead, state, Boolean(data.running));
       if (state?.sessionWait) setAgentPhase({ kind: "waiting_event", ...state.sessionWait });
       const busy = data.running && state
         && (state.isStreaming || state.isPromptRunning || state.isCompacting);
@@ -1108,7 +1139,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } catch {
       // Network still down — the next poll / visibility / online tick retries.
     }
-  }, [finishPromptWithoutStream]);
+  }, [finishPromptWithoutStream, applyQueueRead, captureQueueRead]);
 
   // Recovery net for missed SSE events: while the agent is running, verify
   // against the server periodically and whenever the tab returns to the
@@ -1167,17 +1198,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         setRetryInfo(null);
         dispatch({ type: "end" });
         if (sessionIdRef.current) {
+          const queueRead = captureQueueRead(sessionIdRef.current);
           loadSession(sessionIdRef.current);
           fetch(`/api/agent/${encodeURIComponent(sessionIdRef.current)}`)
             .then((r) => r.json())
-            .then((d: { state?: AgentStateResponse }) => {
+            .then((d: { running?: boolean; state?: AgentStateResponse }) => {
               if (d.state?.contextUsage !== undefined) setContextUsage(d.state.contextUsage ?? null);
               if (d.state?.systemPrompt !== undefined) setSystemPrompt(d.state.systemPrompt ?? null);
               if (d.state?.extensionStatuses !== undefined) setExtensionStatuses(d.state.extensionStatuses ?? []);
               if (d.state?.extensionWidgets !== undefined) setExtensionWidgets(d.state.extensionWidgets ?? []);
               // Aborted turns can leave messages queued in pi (delivered with the
               // next turn); dead wrapper (no state) means the queue is gone.
-              setQueuedMessages(normalizeQueuedMessages(d.state?.queuedMessages));
+              applyQueueRead(queueRead, d.state, Boolean(d.running));
             })
             .catch(() => {});
         }
@@ -1329,10 +1361,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         break;
       }
       case "queue_update":
-        setQueuedMessages({
-          steering: [...((event.steering as string[] | undefined) ?? [])],
-          followUp: [...((event.followUp as string[] | undefined) ?? [])],
-        });
+        applyQueueSnapshot(event.queue);
         break;
       case "auto_retry_start":
         setRetryInfo({ attempt: event.attempt as number, maxAttempts: event.maxAttempts as number, errorMessage: event.errorMessage as string | undefined });
@@ -1361,7 +1390,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         handleExtensionUiRequest(event as ExtensionUiRequest);
         break;
     }
-  }, [addNotice, cancelEventStreamGrace, handleExtensionUiRequest, loadSession, notifyPromptStage, onAgentEnd, scheduleEventStreamClose, scrollToBottom, settleUiStage]);
+  }, [addNotice, cancelEventStreamGrace, handleExtensionUiRequest, loadSession, notifyPromptStage, onAgentEnd, scheduleEventStreamClose, scrollToBottom, settleUiStage, applyQueueRead, applyQueueSnapshot, captureQueueRead]);
   handleAgentEventRef.current = handleAgentEvent;
 
   const handleSend = useCallback(async (message: string, images?: AttachedImage[]) => {
@@ -1800,26 +1829,31 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleRecallQueue = useCallback(async () => {
     const sid = sessionIdRef.current;
     if (!sid) return;
-    const pending = pendingRecallOperationRef.current;
-    const operation = pending?.sessionId === sid ? pending
-      : { sessionId: sid, operationId: crypto.randomUUID(), timestamp: Date.now() };
-    pendingRecallOperationRef.current = operation;
+    if (getRecallFailure(sid)) {
+      if (!window.confirm("The earlier recall outcome is unknown. Abandon that result and start a NEW recall of the currently queued messages? This cannot recover the earlier text.")) return;
+      abandonUnknownRecall(sid);
+    }
+    const epoch = queueViewEpochRef.current;
     try {
-      const result = await sendAgentCommand<{ steering?: string[]; followUp?: string[] }>(sid,
-        { type: "clear_queue", operationId: operation.operationId, timestamp: operation.timestamp });
-      pendingRecallOperationRef.current = null;
-      // clearQueue also emits an empty queue_update, but that only reaches us
-      // while SSE is connected — clear locally so idle recalls update the UI.
-      setQueuedMessages({ steering: [], followUp: [] });
-      const texts = [...(result?.steering ?? []), ...(result?.followUp ?? [])];
-      if (texts.length > 0) {
-        opts.chatInputRef?.current?.prependText(texts.join("\n\n"));
+      const tracker = queueTracker(sid);
+      if (!tracker.snapshot) {
+        const read = captureQueueRead(sid);
+        const response = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json() as { running?: boolean; state?: AgentStateResponse };
+        applyQueueRead(read, data.state, Boolean(data.running));
       }
+      if (!queueViewAliveRef.current || epoch !== queueViewEpochRef.current) return;
+      if (!tracker.snapshot) throw new Error("Queue runtime is unavailable; synchronize the session before recalling");
+      // The operation and draft restoration outlive this view. Only applying
+      // its queue snapshot is conditional on the original view still existing.
+      const result = await recallQueue(sid, tracker.snapshot.runtimeId);
+      if (queueViewAliveRef.current && epoch === queueViewEpochRef.current && sessionIdRef.current === sid) applyQueueSnapshot(result.queue);
     } catch (e) {
       console.error("Failed to recall queued messages:", e);
-      addNotice({ type: "error", message: "Failed to recall queued messages" });
+      if (queueViewAliveRef.current && epoch === queueViewEpochRef.current) addNotice({ type: "error", message: String(e) });
     }
-  }, [opts.chatInputRef, addNotice]);
+  }, [addNotice, queueTracker, captureQueueRead, applyQueueRead, applyQueueSnapshot]);
 
   const handleThinkingLevelChange = useCallback(async (level: ThinkingLevelOption) => {
     setThinkingLevel(level);
@@ -1924,7 +1958,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (agentState.state.thinkingLevel !== undefined) setThinkingLevel((agentState.state.thinkingLevel as ThinkingLevelOption) ?? "auto");
           if (agentState.state.extensionStatuses !== undefined) setExtensionStatuses(agentState.state.extensionStatuses ?? []);
           if (agentState.state.extensionWidgets !== undefined) setExtensionWidgets(agentState.state.extensionWidgets ?? []);
-          if (agentState.state.queuedMessages !== undefined) setQueuedMessages(normalizeQueuedMessages(agentState.state.queuedMessages));
         }
       });
     }

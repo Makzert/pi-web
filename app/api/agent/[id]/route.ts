@@ -19,6 +19,11 @@ export async function POST(
       return NextResponse.json({ success: true, data: result });
     }
 
+    // Do not cold-start a replacement to execute an earlier runtime's recall.
+    if (body.type === "clear_queue" && body.expectedRuntimeId !== undefined) {
+      return NextResponse.json({ error: "Queue runtime no longer exists; recall outcome is unknown", code: "QUEUE_INSTANCE_CHANGED" }, { status: 409 });
+    }
+
     const filePath = await resolveSessionPath(id);
     if (!filePath) {
       return NextResponse.json({ error: "Session not found" }, { status: 404 });
@@ -29,7 +34,7 @@ export async function POST(
 
     return NextResponse.json({ success: true, data: result });
   } catch (error) {
-    return NextResponse.json({ error: String(error) }, { status: 500 });
+    return NextResponse.json({ error: String(error), code: (error as { code?: string })?.code }, { status: 500 });
   }
 }
 
