@@ -133,7 +133,7 @@
          catch (error) {
 +            // A stage commit failure is an infrastructure barrier, not an assistant
 +            // response. The caller must keep the session stopped until it is resolved.
-+            if (error?.code === "STAGE_COMMIT_UNAVAILABLE" || error?.code === "STAGE_COMMIT_CONFLICT") {
++            if (error?.code === "STAGE_COMMIT_UNAVAILABLE" || error?.code === "STAGE_COMMIT_CONFLICT" || error?.code === "NODE_OUTCOME_UNKNOWN") {
 +                throw error;
 +            }
              await this.handleRunFailure(error, abortController.signal.aborted);
@@ -157,7 +157,7 @@
          }
 +        if (event.type === "message_end") {
 +            this._state.streamingMessage = undefined;
-+            this._state.messages.push(event.message);
++            if (!globalThis[Symbol.for("ultron.brain.applied-messages.v1")]?.has(event.message)) this._state.messages.push(event.message);
 +        }
      }
  }

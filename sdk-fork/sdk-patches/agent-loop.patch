@@ -26,42 +26,49 @@
              const nextTurnContext = {
                  message,
                  toolResults,
-@@ -189,6 +201,7 @@
+@@ -189,8 +201,10 @@
          messages: llmMessages,
          tools: context.tools,
      };
 +    await emit({ type: "generation_context", model: config.model, reasoning: config.reasoning, context: llmContext });
      // Resolve API key (important for expiring tokens)
      const resolvedApiKey = (config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
++    await emit({ type: "generation_dispatch" });
      const response = await streamFunction(config.model, llmContext, {
-@@ -443,6 +456,8 @@
+         ...config,
+         apiKey: resolvedApiKey,
+@@ -443,6 +457,8 @@
          };
      }
      catch (error) {
-+        if (error?.code === "STAGE_COMMIT_UNAVAILABLE" || error?.code === "STAGE_COMMIT_CONFLICT")
++        if (error?.code === "STAGE_COMMIT_UNAVAILABLE" || error?.code === "STAGE_COMMIT_CONFLICT" || error?.code === "NODE_OUTCOME_UNKNOWN")
 +            throw error;
          return {
              kind: "immediate",
              result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
-@@ -470,6 +485,8 @@
-         return { result, isError: false };
+@@ -467,9 +483,11 @@
+         });
+         acceptingUpdates = false;
+         await Promise.all(updateEvents);
+-        return { result, isError: false };
++        return { result, isError: result?.isError === true };
      }
      catch (error) {
-+        if (error?.code === "STAGE_COMMIT_UNAVAILABLE" || error?.code === "STAGE_COMMIT_CONFLICT")
++        if (error?.code === "STAGE_COMMIT_UNAVAILABLE" || error?.code === "STAGE_COMMIT_CONFLICT" || error?.code === "NODE_OUTCOME_UNKNOWN")
 +            throw error;
          acceptingUpdates = false;
          await Promise.all(updateEvents);
          return {
-@@ -506,6 +523,8 @@
+@@ -506,6 +524,8 @@
              }
          }
          catch (error) {
-+            if (error?.code === "STAGE_COMMIT_UNAVAILABLE" || error?.code === "STAGE_COMMIT_CONFLICT")
++            if (error?.code === "STAGE_COMMIT_UNAVAILABLE" || error?.code === "STAGE_COMMIT_CONFLICT" || error?.code === "NODE_OUTCOME_UNKNOWN")
 +                throw error;
              result = createErrorToolResult(error instanceof Error ? error.message : String(error));
              isError = true;
          }
-@@ -550,4 +569,4 @@
+@@ -550,4 +570,4 @@
      await emit({ type: "message_start", message: toolResultMessage });
      await emit({ type: "message_end", message: toolResultMessage });
  }

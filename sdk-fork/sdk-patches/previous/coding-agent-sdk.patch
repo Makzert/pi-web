@@ -1,0 +1,40 @@
+--- a/dist/core/sdk.js
++++ b/dist/core/sdk.js
+@@ -64,6 +64,10 @@
+  * ```
+  */
+ export async function createAgentSession(options = {}) {
++    if (process.env.ULTRON_MANAGED_BRAIN === "1" && !options.managedBrainBackend) {
++        throw new Error("managed Brain cannot start without a real majority-commit StageStore");
++    }
++    if (options.managedBrainBackend) await options.managedBrainBackend.assertReady();
+     const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
+     const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
+     let resourceLoader = options.resourceLoader;
+@@ -203,6 +207,11 @@
+             if (!runner?.hasHandlers("before_provider_request")) {
+                 return payload;
+             }
++            if (options.managedBrainBackend) {
++                const error = new Error("managed Brain: before_provider_request semantic hooks must run before generation_context confirmation");
++                error.code = "STAGE_COMMIT_CONFLICT";
++                throw error;
++            }
+             return runner.emitBeforeProviderRequest(payload);
+         },
+         onResponse: async (response, _model) => {
+@@ -259,10 +268,12 @@
+         sessionStartEvent: options.sessionStartEvent,
+     });
+     const extensionsResult = resourceLoader.getExtensions();
++    session._managedBrainBackend = options.managedBrainBackend;
++    session._deferBrainReady = Boolean(options.managedBrainBackend);
+     return {
+         session,
+         extensionsResult,
+         modelFallbackMessage,
+     };
+ }
+-//# sourceMappingURL=sdk.js.map
+\ No newline at end of file
++//# sourceMappingURL=sdk.js.map

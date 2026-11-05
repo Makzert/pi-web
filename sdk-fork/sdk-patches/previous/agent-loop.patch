@@ -1,0 +1,74 @@
+--- a/dist/agent-loop.js
++++ b/dist/agent-loop.js
+@@ -51,6 +51,14 @@
+     for (const prompt of prompts) {
+         await emit({ type: "message_start", message: prompt });
+         await emit({ type: "message_end", message: prompt });
++    }
++    // Deferred next-turn events are accepted only after the direct prompt and
++    // before the first model request, preserving the committed history order.
++    for (const message of (await config.getNextTurnMessages?.()) || []) {
++        await emit({ type: "message_start", message });
++        await emit({ type: "message_end", message });
++        currentContext.messages.push(message);
++        newMessages.push(message);
+     }
+     await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
+     return newMessages;
+@@ -129,6 +137,10 @@
+                 }
+             }
+             await emit({ type: "turn_end", message, toolResults });
++            if (signal?.aborted) {
++                await emit({ type: "agent_end", messages: newMessages });
++                return;
++            }
+             const nextTurnContext = {
+                 message,
+                 toolResults,
+@@ -189,6 +201,7 @@
+         messages: llmMessages,
+         tools: context.tools,
+     };
++    await emit({ type: "generation_context", model: config.model, reasoning: config.reasoning, context: llmContext });
+     // Resolve API key (important for expiring tokens)
+     const resolvedApiKey = (config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+     const response = await streamFunction(config.model, llmContext, {
+@@ -443,6 +456,8 @@
+         };
+     }
+     catch (error) {
++        if (error?.code === "STAGE_COMMIT_UNAVAILABLE" || error?.code === "STAGE_COMMIT_CONFLICT" || error?.code === "NODE_OUTCOME_UNKNOWN")
++            throw error;
+         return {
+             kind: "immediate",
+             result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+@@ -467,9 +482,11 @@
+         });
+         acceptingUpdates = false;
+         await Promise.all(updateEvents);
+-        return { result, isError: false };
++        return { result, isError: result?.isError === true };
+     }
+     catch (error) {
++        if (error?.code === "STAGE_COMMIT_UNAVAILABLE" || error?.code === "STAGE_COMMIT_CONFLICT" || error?.code === "NODE_OUTCOME_UNKNOWN")
++            throw error;
+         acceptingUpdates = false;
+         await Promise.all(updateEvents);
+         return {
+@@ -506,6 +523,8 @@
+             }
+         }
+         catch (error) {
++            if (error?.code === "STAGE_COMMIT_UNAVAILABLE" || error?.code === "STAGE_COMMIT_CONFLICT" || error?.code === "NODE_OUTCOME_UNKNOWN")
++                throw error;
+             result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+             isError = true;
+         }
+@@ -550,4 +569,4 @@
+     await emit({ type: "message_start", message: toolResultMessage });
+     await emit({ type: "message_end", message: toolResultMessage });
+ }
+-//# sourceMappingURL=agent-loop.js.map
+\ No newline at end of file
++//# sourceMappingURL=agent-loop.js.map

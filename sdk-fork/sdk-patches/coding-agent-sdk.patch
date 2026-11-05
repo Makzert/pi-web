@@ -1,16 +1,62 @@
 --- a/dist/core/sdk.js
 +++ b/dist/core/sdk.js
-@@ -64,6 +64,9 @@
+@@ -64,6 +64,10 @@
   * ```
   */
  export async function createAgentSession(options = {}) {
-+    if (process.env.ULTRON_MANAGED_BRAIN === "1") {
++    if (process.env.ULTRON_MANAGED_BRAIN === "1" && !options.managedBrainBackend) {
 +        throw new Error("managed Brain cannot start without a real majority-commit StageStore");
 +    }
++    if (options.managedBrainBackend) await options.managedBrainBackend.assertReady();
      const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
      const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
      let resourceLoader = options.resourceLoader;
-@@ -265,4 +268,4 @@
+@@ -167,6 +171,7 @@
+         });
+     };
+     const extensionRunnerRef = {};
++    const managedBrainBackend = options.managedBrainBackend;
+     agent = new Agent({
+         initialState: {
+             systemPrompt: "",
+@@ -192,16 +197,26 @@
+                 maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+                 transformHeaders: async (requestHeaders) => {
+                     const headers = mergeProviderAttributionHeaders(model, settingsManager, options?.sessionId, requestHeaders);
+-                    return headerRunner?.hasHandlers("before_provider_headers")
+-                        ? headerRunner.emitBeforeProviderHeaders(headers ?? {})
++                    const finalHeaders = headerRunner?.hasHandlers("before_provider_headers")
++                        ? await headerRunner.emitBeforeProviderHeaders(headers ?? {})
+                         : (headers ?? {});
++                    await managedBrainBackend?.assertDispatchReady?.();
++                    managedBrainBackend?.assertExecution();
++                    return finalHeaders;
+                 },
+             });
+         },
+         onPayload: async (payload, _model) => {
++            await managedBrainBackend?.assertDispatchReady?.();
++            managedBrainBackend?.assertExecution();
+             const runner = extensionRunnerRef.current;
+             if (!runner?.hasHandlers("before_provider_request")) {
+                 return payload;
++            }
++            if (options.managedBrainBackend) {
++                const error = new Error("managed Brain: before_provider_request semantic hooks must run before generation_context confirmation");
++                error.code = "STAGE_COMMIT_CONFLICT";
++                throw error;
+             }
+             return runner.emitBeforeProviderRequest(payload);
+         },
+@@ -259,10 +274,12 @@
+         sessionStartEvent: options.sessionStartEvent,
+     });
+     const extensionsResult = resourceLoader.getExtensions();
++    session._managedBrainBackend = options.managedBrainBackend;
++    session._deferBrainReady = Boolean(options.managedBrainBackend);
+     return {
+         session,
+         extensionsResult,
          modelFallbackMessage,
      };
  }

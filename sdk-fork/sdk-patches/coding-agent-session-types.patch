@@ -105,7 +105,16 @@
      /**
       * Manually compact the session context.
       * Aborts current agent operation first.
-@@ -646,4 +672,4 @@
+@@ -503,6 +529,8 @@
+     setAutoCompactionEnabled(enabled: boolean): void;
+     /** Whether auto-compaction is enabled */
+     get autoCompactionEnabled(): boolean;
++    activateCommittedSession(): void;
++    resumeCommittedQueue(): Promise<boolean>;
+     bindExtensions(bindings: ExtensionBindings): Promise<void>;
+     private extendResourcesFromExtensions;
+     private buildExtensionResourcePaths;
+@@ -646,4 +674,4 @@
       */
      get extensionRunner(): ExtensionRunner;
  }

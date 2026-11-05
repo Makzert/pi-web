@@ -82,7 +82,7 @@
      _getIdleWaitPromise() {
          if (!this._idleWaitPromise) {
              this._idleWaitPromise = new Promise((resolve) => {
-@@ -332,15 +362,21 @@
+@@ -332,15 +362,26 @@
          }
          finally {
              this._resolveIdleWaitIfIdle();
@@ -97,6 +97,11 @@
 -        // When a user message starts, check if it's from either queue and remove it BEFORE emitting
 -        // This ensures the UI sees the updated queue state
 -        if (event.type === "message_start" && event.message.role === "user") {
++        if (event.type === "generation_dispatch") {
++            await this._managedBrainBackend?.assertDispatchReady?.();
++            this._managedBrainBackend?.assertExecution();
++            return;
++        }
 +        if (event.type === "generation_context") {
 +            await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "generation_context", model: event.model, reasoning: event.reasoning, context: event.context });
 +            return;
@@ -107,7 +112,7 @@
              this._overflowRecoveryAttempted = false;
              const messageText = contentText(event.message.content, "");
              if (messageText) {
-@@ -361,15 +397,27 @@
+@@ -361,21 +402,33 @@
              }
          }
          // Emit to extensions first
@@ -131,12 +136,20 @@
              // Check if this is a custom message from extensions
              if (event.message.role === "custom") {
                  // Persist as CustomMessageEntry
-                 this.sessionManager.appendCustomMessageEntry(event.message.customType, event.message.content, event.message.display, event.message.details);
+-                this.sessionManager.appendCustomMessageEntry(event.message.customType, event.message.content, event.message.display, event.message.details);
++                if (!globalThis[Symbol.for("ultron.brain.applied-messages.v1")]?.has(event.message)) this.sessionManager.appendCustomMessageEntry(event.message.customType, event.message.content, event.message.display, event.message.details);
 +                await this._sessionEvents.consumed(event.message);
              }
              else if (event.message.role === "user" ||
                  event.message.role === "assistant" ||
-@@ -554,6 +602,7 @@
+                 event.message.role === "toolResult") {
+                 // Regular LLM message - persist as SessionMessageEntry
+-                this.sessionManager.appendMessage(event.message);
++                if (!globalThis[Symbol.for("ultron.brain.applied-messages.v1")]?.has(event.message)) this.sessionManager.appendMessage(event.message);
+             }
+             // Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+             // Track assistant message for auto-compaction (checked on agent_end)
+@@ -554,6 +607,7 @@
       * Call this when completely done with the session.
       */
      dispose() {
@@ -144,7 +157,7 @@
          try {
              this.abortRetry();
              this.abortCompaction();
-@@ -741,13 +790,18 @@
+@@ -741,13 +795,18 @@
      // =========================================================================
      // Prompting
      // =========================================================================
@@ -165,7 +178,7 @@
          }
          finally {
              this._systemPromptOverride = undefined;
-@@ -756,6 +810,7 @@
+@@ -756,6 +815,7 @@
          }
      }
      async _handlePostAgentRun() {
@@ -173,7 +186,7 @@
          const msg = this._lastAssistantMessage;
          this._lastAssistantMessage = undefined;
          if (!msg) {
-@@ -790,10 +845,28 @@
+@@ -790,10 +850,28 @@
       * @throws Error if no model selected or no API key available (when not streaming)
       */
      async prompt(text, options) {
@@ -202,7 +215,7 @@
              // Handle extension commands first (execute immediately, even during streaming)
              // Extension commands manage their own LLM interaction via pi.sendMessage()
              if (expandPromptTemplates && text.startsWith("/")) {
-@@ -801,6 +874,7 @@
+@@ -801,6 +879,7 @@
                  if (handled) {
                      // Extension command executed, no prompt to send
                      preflightResult?.(true);
@@ -210,7 +223,7 @@
                      return;
                  }
              }
-@@ -814,6 +888,7 @@
+@@ -814,6 +893,7 @@
                  const inputResult = await this._extensionRunner.emitInput(currentText, currentImages, options?.source ?? "interactive", this.isStreaming ? options?.streamingBehavior : undefined);
                  if (inputResult.action === "handled") {
                      preflightResult?.(true);
@@ -218,7 +231,7 @@
                      return;
                  }
                  if (inputResult.action === "transform") {
-@@ -833,12 +908,13 @@
+@@ -833,12 +913,13 @@
                      throw new Error("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
                  }
                  if (options.streamingBehavior === "followUp") {
@@ -234,7 +247,7 @@
                  return;
              }
              // Flush any pending bash messages before the new prompt
-@@ -874,13 +950,13 @@
+@@ -874,13 +955,13 @@
              messages.push({
                  role: "user",
                  content: userContent,
@@ -253,7 +266,7 @@
              // Emit before_agent_start extension event
              const result = await this._extensionRunner.emitBeforeAgentStart(expandedText, currentImages, this._baseSystemPrompt, this._baseSystemPromptOptions);
              // Add all custom messages from extensions
-@@ -910,13 +986,25 @@
+@@ -910,13 +991,25 @@
          }
          catch (error) {
              preflightResult?.(false);
@@ -280,7 +293,7 @@
      }
      /**
       * Try to execute an extension command. Returns true if command was found and executed.
-@@ -983,7 +1071,12 @@
+@@ -983,7 +1076,12 @@
       * @param images Optional image attachments to include with the message
       * @throws Error if text is an extension command
       */
@@ -294,7 +307,7 @@
          // Check for extension commands (cannot be queued)
          if (text.startsWith("/")) {
              this._throwIfExtensionCommand(text);
-@@ -991,7 +1084,7 @@
+@@ -991,7 +1089,7 @@
          // Expand skill commands and prompt templates
          let expandedText = this._expandSkillCommand(text);
          expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
@@ -303,7 +316,7 @@
      }
      /**
       * Queue a follow-up message to be processed after the agent finishes.
-@@ -1000,7 +1093,12 @@
+@@ -1000,7 +1098,12 @@
       * @param images Optional image attachments to include with the message
       * @throws Error if text is an extension command
       */
@@ -317,7 +330,7 @@
          // Check for extension commands (cannot be queued)
          if (text.startsWith("/")) {
              this._throwIfExtensionCommand(text);
-@@ -1008,38 +1106,186 @@
+@@ -1008,38 +1111,187 @@
          // Expand skill commands and prompt templates
          let expandedText = this._expandSkillCommand(text);
          expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
@@ -392,6 +405,7 @@
 +        return finalMessage;
 +    }
 +    async _takeQueuedMessages(lane) {
++        if (this._managedBrainBackend?.canConsumeQueue && !this._managedBrainBackend.canConsumeQueue(lane)) return [];
 +        try {
 +            return await this._serializeQueueMutation(async () => {
 +            let pending = this._pendingQueueTake;
@@ -526,7 +540,7 @@
          });
      }
      /**
-@@ -1073,8 +1319,31 @@
+@@ -1073,8 +1325,31 @@
              content: message.content ?? [],
              display: message.display,
              details: message.details,
@@ -559,7 +573,20 @@
          if (options?.deliverAs === "nextTurn") {
              this._pendingNextTurnMessages.push(appMessage);
          }
-@@ -1131,6 +1400,8 @@
+@@ -1090,8 +1365,10 @@
+             await this._runAgentPrompt(appMessage);
+         }
+         else {
+-            this.agent.state.messages.push(appMessage);
+-            this.sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
++            if (!globalThis[Symbol.for("ultron.brain.applied-messages.v1")]?.has(appMessage)) {
++                this.agent.state.messages.push(appMessage);
++                this.sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
++            }
+             this._emit({ type: "message_start", message: appMessage });
+             this._emit({ type: "message_end", message: appMessage });
+         }
+@@ -1131,6 +1408,8 @@
              streamingBehavior: options?.deliverAs,
              images,
              source: "extension",
@@ -568,7 +595,7 @@
          });
      }
      /**
-@@ -1139,6 +1410,7 @@
+@@ -1139,6 +1418,7 @@
       * @returns Object with steering and followUp arrays
       */
      clearQueue() {
@@ -576,7 +603,7 @@
          const steering = [...this._steeringMessages];
          const followUp = [...this._followUpMessages];
          this._steeringMessages = [];
-@@ -1147,6 +1419,69 @@
+@@ -1147,6 +1427,69 @@
          this._emitQueueUpdate();
          return { steering, followUp };
      }
@@ -646,7 +673,7 @@
      /** Number of pending messages (includes both steering and follow-up) */
      get pendingMessageCount() {
          return this._steeringMessages.length + this._followUpMessages.length;
-@@ -1166,6 +1501,7 @@
+@@ -1166,6 +1509,7 @@
       * Abort current operation and wait for agent to become idle.
       */
      async abort() {
@@ -654,13 +681,14 @@
          this.abortRetry();
          this.agent.abort();
          await this.waitForIdle();
-@@ -1200,11 +1536,14 @@
+@@ -1200,11 +1544,14 @@
          }
          const previousModel = this.model;
          const thinkingLevel = this._getThinkingLevelForModelSwitch();
 +        await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "context_change", change: { action: "set_model", model, thinkingLevel } });
          this.agent.state.model = model;
-         this.sessionManager.appendModelChange(model.provider, model.id);
+-        this.sessionManager.appendModelChange(model.provider, model.id);
++        if (!this._committedStageProjection) this.sessionManager.appendModelChange(model.provider, model.id);
          this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
          // Re-clamp thinking level for new model's capabilities
 -        this.setThinkingLevel(thinkingLevel);
@@ -670,15 +698,17 @@
          await this._emitModelSelect(model, previousModel, "set");
      }
      /**
-@@ -1232,6 +1571,7 @@
+@@ -1232,15 +1579,18 @@
          const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
          const next = scopedModels[nextIndex];
          const thinkingLevel = this._getThinkingLevelForModelSwitch(next.thinkingLevel);
 +        await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "context_change", change: { action: "cycle_model", model: next.model, thinkingLevel } });
          // Apply model
          this.agent.state.model = next.model;
-         this.sessionManager.appendModelChange(next.model.provider, next.model.id);
-@@ -1240,7 +1580,9 @@
+-        this.sessionManager.appendModelChange(next.model.provider, next.model.id);
++        if (!this._committedStageProjection) this.sessionManager.appendModelChange(next.model.provider, next.model.id);
+         this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
+         // Apply thinking level.
          // - Explicit scoped model thinking level overrides current session level
          // - Undefined scoped model thinking level inherits the current session preference
          // setThinkingLevel clamps to model capabilities.
@@ -689,13 +719,14 @@
          await this._emitModelSelect(next.model, currentModel, "cycle");
          return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
      }
-@@ -1256,11 +1598,14 @@
+@@ -1256,11 +1606,14 @@
          const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
          const nextModel = availableModels[nextIndex];
          const thinkingLevel = this._getThinkingLevelForModelSwitch();
 +        await this._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "context_change", change: { action: "cycle_model", model: nextModel, thinkingLevel } });
          this.agent.state.model = nextModel;
-         this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+-        this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
++        if (!this._committedStageProjection) this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
          this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
          // Re-clamp thinking level for new model's capabilities
 -        this.setThinkingLevel(thinkingLevel);
@@ -705,7 +736,7 @@
          await this._emitModelSelect(nextModel, currentModel, "cycle");
          return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
      }
-@@ -1273,6 +1618,7 @@
+@@ -1273,6 +1626,7 @@
       * Saves to session and settings only if the level actually changes.
       */
      setThinkingLevel(level) {
@@ -713,7 +744,16 @@
          const availableLevels = this.getAvailableThinkingLevels();
          const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
          // Only persist if actually changing
-@@ -1337,6 +1683,7 @@
+@@ -1280,7 +1634,7 @@
+         const isChanging = effectiveLevel !== previousLevel;
+         this.agent.state.thinkingLevel = effectiveLevel;
+         if (isChanging) {
+-            this.sessionManager.appendThinkingLevelChange(effectiveLevel);
++            if (!this._committedStageProjection) this.sessionManager.appendThinkingLevelChange(effectiveLevel);
+             if (this.supportsThinking() || effectiveLevel !== "off") {
+                 this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
+             }
+@@ -1337,6 +1691,7 @@
      // Queue Mode Management
      // =========================================================================
      syncQueueModesFromSettings() {
@@ -721,7 +761,7 @@
          this.agent.steeringMode = this.settingsManager.getSteeringMode();
          this.agent.followUpMode = this.settingsManager.getFollowUpMode();
      }
-@@ -1345,6 +1692,7 @@
+@@ -1345,6 +1700,7 @@
       * Saves to settings.
       */
      setSteeringMode(mode) {
@@ -729,7 +769,7 @@
          this.agent.steeringMode = mode;
          this.settingsManager.setSteeringMode(mode);
      }
-@@ -1353,8 +1701,51 @@
+@@ -1353,8 +1709,51 @@
       * Saves to settings.
       */
      setFollowUpMode(mode) {
@@ -781,7 +821,7 @@
      }
      // =========================================================================
      // Compaction
-@@ -1365,6 +1756,7 @@
+@@ -1365,6 +1764,7 @@
       * @param customInstructions Optional instructions for the compaction summary
       */
      async compact(customInstructions) {
@@ -789,7 +829,7 @@
          await this.abort();
          this._compactionAbortController = new AbortController();
          this._emit({ type: "compaction_start", reason: "manual" });
-@@ -1593,6 +1985,7 @@
+@@ -1593,6 +1993,7 @@
       * Internal: Run auto-compaction with events.
       */
      async _runAutoCompaction(reason, willRetry) {
@@ -797,7 +837,31 @@
          const settings = this.settingsManager.getCompactionSettings();
          let started = false;
          try {
-@@ -1758,8 +2151,11 @@
+@@ -1738,6 +2139,23 @@
+     get autoCompactionEnabled() {
+         return this.settingsManager.getCompactionEnabled();
+     }
++    /** Open automatic consumption only after the leader installed its recovery context. */
++    activateCommittedSession() {
++        this._managedBrainBackend?.assertExecution();
++        this._deferBrainReady = false;
++        this._sessionEvents.markReady();
++    }
++    /** Start confirmed input even for an empty transcript, keeping its admission identity. */
++    async resumeCommittedQueue() {
++        this._managedBrainBackend?.assertExecution();
++        if (this._pendingQueueTake) return this.resumePendingQueueTake();
++        if (this.isStreaming) return false;
++        for (const lane of ["steer", "followUp", "events"]) {
++            const messages = await this._takeQueuedMessages(lane);
++            if (messages.length) { await this._runAgentPrompt(messages, lane); return true; }
++        }
++        return false;
++    }
+     async bindExtensions(bindings) {
+         if (bindings.uiContext !== undefined) {
+             this._extensionUIContext = bindings.uiContext;
+@@ -1758,8 +2176,11 @@
              this._extensionErrorListener = bindings.onError;
          }
          this._applyExtensionBindings(this._extensionRunner);
@@ -805,11 +869,11 @@
          await this._extensionRunner.emit(this._sessionStartEvent);
          await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
 +        await this._sessionEvents.migrate();
-+        this._sessionEvents.markReady();
++        if (!this._deferBrainReady) this._sessionEvents.markReady();
      }
      async extendResourcesFromExtensions(reason) {
          if (!this._extensionRunner.hasHandlers("resources_discover")) {
-@@ -1843,22 +2239,26 @@
+@@ -1843,22 +2264,26 @@
              return [...extensionCommands, ...templates, ...skills];
          };
          runner.bindCore({
@@ -838,7 +902,7 @@
                  });
              },
              appendEntry: (customType, data) => {
-@@ -2050,6 +2450,10 @@
+@@ -2050,6 +2475,10 @@
          });
      }
      async reload(options) {
@@ -849,16 +913,16 @@
          const oldRunner = this._extensionRunner;
          const previousFlagValues = oldRunner.getFlagValues();
          await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
-@@ -2072,6 +2476,8 @@
+@@ -2072,6 +2501,8 @@
              await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
              await this.extendResourcesFromExtensions("reload");
          }
 +        await this._sessionEvents.migrate();
-+        this._sessionEvents.markReady();
++        if (!this._deferBrainReady) this._sessionEvents.markReady();
      }
      // =========================================================================
      // Auto-Retry
-@@ -2197,6 +2603,7 @@
+@@ -2197,6 +2628,7 @@
       * @param options.operations Custom BashOperations for remote execution
       */
      async executeBash(command, onChunk, options) {
@@ -866,7 +930,7 @@
          const abortController = new AbortController();
          this._bashAbortControllers.add(abortController);
          // Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
-@@ -2216,6 +2623,7 @@
+@@ -2216,6 +2648,7 @@
          }
          finally {
              this._bashAbortControllers.delete(abortController);
@@ -874,7 +938,7 @@
          }
      }
      /**
-@@ -2223,6 +2631,7 @@
+@@ -2223,6 +2656,7 @@
       * Used by executeBash and by extensions that handle bash execution themselves.
       */
      recordBashResult(command, result, options) {
@@ -882,7 +946,7 @@
          const bashMessage = {
              role: "bashExecution",
              command,
-@@ -2304,6 +2713,7 @@
+@@ -2304,6 +2738,7 @@
       * @returns Result with editorText (if user message) and cancelled status
       */
      async navigateTree(targetId, options = {}) {
@@ -890,7 +954,7 @@
          if (this.isStreaming) {
              throw new Error("Wait for the current response to finish before navigating the session tree.");
          }
-@@ -2684,4 +3094,4 @@
+@@ -2684,4 +3119,4 @@
          return this._extensionRunner;
      }
  }

@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { open } from "node:fs/promises";
 
 const JOURNAL = "ultron-session-event";
-const TYPES = new Set(["node-bg-result", "node-worker-result", "node-worker-input-required"]);
+const TYPES = new Set(["node-bg-result", "node-worker-result", "node-worker-input-required", "node-watcher-progress"]);
 const MAX_WAIT_MS = 24 * 60 * 60 * 1000;
 function hash(value) {
     const canonical = (v) => Array.isArray(v) ? v.map(canonical) : v && typeof v === "object"
@@ -235,27 +235,34 @@ export class SessionEvents {
                     this.paused = true;
                     this.host._extensionRunner.emitError({ extensionPath: "<session-events>", event: "post_event", error: error instanceof Error ? error.message : String(error) });
                 } finally {
-                    if (!started) await this.host._emitAgentSettled();
+                    if (!started) {
+                        // An empty take is not a completed run. Emitting settled
+                        // would synchronously poke the unchanged queue forever.
+                        this.host._isAgentRunActive = false;
+                        this.host._resolveIdleWaitIfIdle?.();
+                    }
                 }
             })();
         });
     }
     async repairInterruptedWait() {
         const branch = this.host.sessionManager.getBranch();
-        const assistant = [...branch].reverse().find((entry) => entry.type === "message" && entry.message.role === "assistant");
+        const assistantIndex = branch.findLastIndex((entry) => entry.type === "message" && entry.message.role === "assistant");
+        const assistant = branch[assistantIndex];
         const calls = assistant?.message.content?.filter((block) => block.type === "toolCall") ?? [];
         if (calls.length !== 1 || calls[0].name !== "session_wait") return;
         const id = calls[0].id;
-        if (branch.some((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === id)) return;
+        if (branch.slice(assistantIndex + 1).some((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === id)) return;
         // A JS promise cannot survive restart. Close only our side-effect-free
         // wait call; never synthesize results for arbitrary Node tool calls.
         const message = { role: "toolResult", toolCallId: id, toolName: "session_wait",
             content: [{ type: "text", text: "The previous session_wait was interrupted by host restart. No background job was canceled or restarted. Pending events will be delivered before the next model request." }],
             details: { reason: "interrupted", waitedMs: 0 }, isError: false, timestamp: assistant.message.timestamp };
         await this.host._extensionRunner.emitStageCommit({ type: "stage_commit", phase: "wait_interrupted", toolCallId: id, message });
-        this.host.sessionManager.appendMessage(message);
+        const applied = globalThis[Symbol.for("ultron.brain.applied-messages.v1")]?.has(message);
+        if (!applied) this.host.sessionManager.appendMessage(message);
         await this.flushLocal();
-        this.host.agent.state.messages.push(message);
+        if (!applied) this.host.agent.state.messages.push(message);
         this.host._emit({ type: "message_start", message });
         this.host._emit({ type: "message_end", message });
     }

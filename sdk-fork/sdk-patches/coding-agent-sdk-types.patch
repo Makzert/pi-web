@@ -1,0 +1,24 @@
+--- a/dist/core/sdk.d.ts
++++ b/dist/core/sdk.d.ts
+@@ -7,7 +7,14 @@
+ import { SessionManager } from "./session-manager.ts";
+ import { SettingsManager } from "./settings-manager.ts";
+ import { createBashTool, createCodingTools, createEditTool, createFindTool, createGrepTool, createLsTool, createReadOnlyTools, createReadTool, createWriteTool, withFileMutationQueue } from "./tools/index.ts";
++export interface ManagedBrainBackend {
++    assertReady(): Promise<void>;
++    assertExecution(): void;
++    assertDispatchReady?(): Promise<void>;
++    canConsumeQueue?(lane: string): boolean;
++}
+ export interface CreateAgentSessionOptions {
++    managedBrainBackend?: ManagedBrainBackend;
+     /** Working directory for project-local discovery. Default: process.cwd() */
+     cwd?: string;
+     /** Global config directory. Default: ~/.pi/agent */
+@@ -105,4 +112,4 @@
+  * ```
+  */
+ export declare function createAgentSession(options?: CreateAgentSessionOptions): Promise<CreateAgentSessionResult>;
+-//# sourceMappingURL=sdk.d.ts.map
+\ No newline at end of file
++//# sourceMappingURL=sdk.d.ts.map
