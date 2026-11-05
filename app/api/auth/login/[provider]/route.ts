@@ -19,6 +19,8 @@ export async function POST(
   req: Request,
   { params }: { params: Promise<{ provider: string }> }
 ) {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return Response.json({ error: "Configure providers, plugins and skills on the Brain Hosts; Web-local resource settings are unavailable in managed mode" }, { status: 409 });
+
   const { provider } = await params;
   const { token, code } = (await req.json()) as { token?: string; code?: string };
 
@@ -46,6 +48,8 @@ export async function GET(
   req: Request,
   { params }: { params: Promise<{ provider: string }> }
 ) {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return Response.json({ error: "Configure providers, plugins and skills on the Brain Hosts; Web-local resource settings are unavailable in managed mode" }, { status: 409 });
+
   const { provider } = await params;
 
   const encoder = new TextEncoder();

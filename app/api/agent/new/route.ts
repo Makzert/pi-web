@@ -27,6 +27,23 @@ export async function POST(req: Request) {
     if (!cwd || typeof cwd !== "string") {
       return NextResponse.json({ error: "cwd is required" }, { status: 400 });
     }
+    if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") {
+      const { brainHostClient, brainState, brainErrorResponse, remoteToolNames } = await import("@/lib/brain-host");
+      try {
+        const client = brainHostClient();
+        const level = parseThinkingLevel(command.thinkingLevel);
+        const provider = command.provider; const modelId = command.modelId;
+        if ((provider && !modelId) || (!provider && modelId)) throw new Error("provider and modelId must be provided together");
+        const result = await client.request<{ sessionId: string }>("/sessions", { method: "POST", body: JSON.stringify({ sessionId: randomUUID(), config: { cwd,
+          ...(provider && modelId ? { modelRef: { provider, id: modelId } } : {}), ...(level ? { thinkingLevel: level } : {}),
+          ...(command.toolNames !== undefined ? { tools: remoteToolNames(command.toolNames) } : {}) } }) });
+        const state = brainState(await client.view(result.sessionId));
+        const model = state.model as { provider?: string; id?: string } | undefined;
+        const data = command.type === "ensure_session" ? null : await client.command(result.sessionId, command);
+        return NextResponse.json({ success: true, sessionId: result.sessionId, data,
+          model: model?.id ? { provider: model.provider, modelId: model.id } : null, thinkingLevel: state.thinkingLevel });
+      } catch (error) { return brainErrorResponse(error); }
+    }
     if (!existsSync(cwd)) {
       return NextResponse.json({ error: `Directory does not exist: ${cwd}` }, { status: 400 });
     }

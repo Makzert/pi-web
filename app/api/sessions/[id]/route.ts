@@ -119,6 +119,10 @@ export async function GET(
 ) {
   const { id } = await params;
   try {
+    if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") {
+      const { brainHostClient, brainSessionData, brainErrorResponse } = await import("@/lib/brain-host");
+      try { return NextResponse.json(brainSessionData(await brainHostClient().view(id))); } catch (error) { return brainErrorResponse(error); }
+    }
     const filePath = await resolveSessionPath(id);
     if (!filePath) {
       return NextResponse.json({ error: "Session not found" }, { status: 404 });
@@ -186,6 +190,7 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return NextResponse.json({ error: "Renaming managed sessions is not available" }, { status: 409 });
   try {
     const { name } = await req.json() as { name?: string };
     if (typeof name !== "string") {
@@ -210,6 +215,7 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return NextResponse.json({ error: "Deleting managed sessions is not available" }, { status: 409 });
   try {
     const filePath = await resolveSessionPath(id);
     if (!filePath) {

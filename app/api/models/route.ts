@@ -93,6 +93,10 @@ const EMPTY_MODELS: ModelsData = {
 };
 
 export async function GET(req: Request) {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") {
+    const { brainHostClient, brainErrorResponse } = await import("@/lib/brain-host");
+    try { return Response.json(await brainHostClient().request("/models")); } catch (error) { return brainErrorResponse(error); }
+  }
   const requestedCwd = new URL(req.url).searchParams.get("cwd") || process.cwd();
   const cwd = resolve(requestedCwd);
 

@@ -20,6 +20,10 @@ export async function POST(req: Request) {
     if (!cwd) {
       return NextResponse.json({ error: "Path is required" }, { status: 400 });
     }
+    if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") {
+      if (!isAbsolute(cwd) && !/^[A-Za-z]:[\\/]/.test(cwd) && !cwd.startsWith("\\\\")) return NextResponse.json({ error: "Enter an absolute project context path" }, { status: 400 });
+      return NextResponse.json({ success: true, cwd, managedBrain: true });
+    }
 
     const normalizedCwd = normalizeCwd(cwd);
     let stat: Stats;

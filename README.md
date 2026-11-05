@@ -107,6 +107,25 @@ npm run lint
 
 Avoid running `next build` / `npm run build` during local development. It writes to `.next/` and can interfere with the dev server; leave builds for release work.
 
+## Managed Brain mode
+
+Run the Web server as a client of the replicated Brain Pi Host:
+
+```sh
+BRAIN_HOST_URL=http://127.0.0.1:9080 \
+BRAIN_HOST_TOKEN='<host-api-secret>' \
+BRAIN_HOST_URLS=http://100.64.0.12:9080,http://100.64.0.13:9080 \
+BRAIN_PROJECT_CWD=/project/context npm run dev
+```
+
+`BRAIN_HOST_URL` or `BRAIN_HOST_URLS` selects managed mode. `BRAIN_HOST_TOKEN` stays on the Next.js server; it is not sent to the browser. `BRAIN_HOST_URLS` accepts a JSON string array or a comma-separated fallback list for restarting the Web server while its first seed is offline. Configure the Pi Hosts' `BRAIN_HOST_PEERS` mapping from consensus API URLs to Host API URLs. Authenticated `/health` responses supply peer hints and the current leader Host; existing connections can follow a new leader after the original process dies. A fresh Web process needs at least one reachable seed or a stable entry point.
+
+The existing session list, chat, commands, running state and SSE routes use the Host. They do not create local AgentSessions or use local JSONL history. Config/model changes and queue recall use the Host's confirmed operations. Unconfirmed previews are removed on disconnect and replaced from a confirmed snapshot; leadership/generation/sequence fencing rejects old frames. Large tool results offer explicit 1 KiB page reads through the Host, which verifies that the result reference belongs to the session. Expired details are shown as expired, not as an unexecuted command.
+
+The project path is context identity; it is not a claim that the Web machine, leader and Node share a disk. Managed mode hides the local file explorer and blocks local filesystem/worktree routes; use Node tools for files. `BRAIN_PROJECT_CWD` supplies the initial context path (default `/`) without creating a local directory. Provider credentials, provider tests, plugins and skills must be configured on the Brain Hosts; managed Web rejects those Web-local configuration routes. Branch navigation, compaction, rename/delete and HTML export retain their explicit unsupported behavior until corresponding committed Host operations exist. Without these environment variables the existing local mode remains available.
+
+Checks are `node_modules/.bin/tsc --noEmit` and `npm test`; do not run `next build` during development. The SDK fork installer, patches and additions must stay synchronized with Ultron's `pi-extensions/brain` sources.
+
 ## Project Structure
 
 ```text

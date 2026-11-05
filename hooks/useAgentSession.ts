@@ -13,16 +13,21 @@ import { normalizeToolCalls } from "@/lib/normalize";
 import { sendAgentCommand } from "@/lib/agent-client";
 import { QueueSnapshotTracker, type QueueReadTicket } from "@/lib/queue-state";
 import { recallQueue, getRecallFailure, abandonUnknownRecall } from "@/lib/queue-recall";
-import { getToolNamesForPreset, type ToolEntry } from "@/lib/tool-presets";
+import { getToolNamesForPreset, getPresetFromTools, type ToolEntry } from "@/lib/tool-presets";
 import { streamReducer } from "@/lib/stream-state";
+import { BrainViewAdmission, type BrainViewStamp } from "@/lib/brain-view-admission";
 import type { SessionStatsInfo } from "@/lib/pi-types";
 
 export interface SessionData {
+  managedBrain?: boolean;
+  viewStamp?: BrainViewStamp;
+  state?: AgentStateResponse;
   sessionId: string;
   filePath: string;
   tree: SessionTreeNode[];
   leafId: string | null;
   revision?: SessionRevision;
+  queue?: unknown;
   context: {
     messages: AgentMessage[];
     entryIds: string[];
@@ -52,6 +57,9 @@ interface LastAssistantTextResponse {
 }
 
 type AgentStateResponse = {
+  managedBrain?: boolean;
+  viewStamp?: BrainViewStamp;
+  activeTools?: string[];
   contextUsage?: { percent: number | null; contextWindow: number; tokens: number | null } | null;
   systemPrompt?: string;
   thinkingLevel?: string;
@@ -404,6 +412,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const backgroundPendingRef = useRef(false);
   const backgroundSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionRevisionRef = useRef<SessionRevision | null>(null);
+  const brainViewRef = useRef(new BrainViewAdmission());
+  const refreshBrainViewRef = useRef<((sid: string) => void) | null>(null);
+  const refreshingBrainViewRef = useRef(false);
+  const pendingConfigRef = useRef(0);
   const pendingQueueInputsRef = useRef(new Map<string, { operationId: string; timestamp: number }>());
   const queueTrackerRef = useRef<QueueSnapshotTracker | null>(null);
   const queueViewEpochRef = useRef(0);
@@ -413,12 +425,36 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     queueViewAliveRef.current = true;
     return () => { queueViewAliveRef.current = false; epochRef.current++; };
   }, []);
+  const setToolPresetState = opts.setToolPreset ?? setToolPreset;
+  const admitView = useCallback((kind: "snapshot" | "state", sid: string, value: SessionData | AgentStateResponse | undefined, read?: ReturnType<BrainViewAdmission["capture"]>) => {
+    if (!queueViewAliveRef.current || sessionIdRef.current !== sid) return false;
+    if (pendingConfigRef.current && (value?.managedBrain || brainViewRef.current.managed(sid))) return false;
+    const admission = brainViewRef.current.admit(kind, sid, queueViewEpochRef.current, value?.viewStamp,
+      Boolean(value?.managedBrain), read, kind === "snapshot" ? (value as SessionData)?.context.entryIds : []);
+    if (admission === "refresh" && !refreshingBrainViewRef.current) {
+      refreshingBrainViewRef.current = true;
+      queueMicrotask(() => refreshBrainViewRef.current?.(sid));
+    }
+    return admission === "accept";
+  }, []);
+  const applyAgentState = useCallback((state?: AgentStateResponse) => {
+    if (!state) return;
+    if (state.contextUsage !== undefined) setContextUsage(state.contextUsage ?? null);
+    if (state.systemPrompt !== undefined) setSystemPrompt(state.systemPrompt ?? null);
+    if (state.thinkingLevel !== undefined) setThinkingLevel((state.thinkingLevel as ThinkingLevelOption) ?? "auto");
+    if (state.extensionStatuses !== undefined) setExtensionStatuses(state.extensionStatuses ?? []);
+    if (state.extensionWidgets !== undefined) setExtensionWidgets(state.extensionWidgets ?? []);
+    if (state.isCompacting !== undefined) setIsCompacting(state.isCompacting);
+    if (state.sessionWait) setAgentPhase({ kind: "waiting_event", ...state.sessionWait });
+    if (state.activeTools) setToolPresetState(getPresetFromTools(state.activeTools.map(name => ({name,description:"",active:true}))));
+  }, [setToolPresetState]);
   const queueTracker = useCallback((sid: string) => {
     if (queueTrackerRef.current?.sessionId !== sid) queueTrackerRef.current = new QueueSnapshotTracker(sid);
     return queueTrackerRef.current;
   }, []);
   const captureQueueRead = useCallback((sid: string) => ({
     tracker: queueTracker(sid), ticket: queueTracker(sid).capture(), epoch: queueViewEpochRef.current,
+    viewRead: brainViewRef.current.capture(sid, queueViewEpochRef.current),
   }), [queueTracker]);
   const applyQueueSnapshot = useCallback((value: unknown, authoritative = false, ticket?: QueueReadTicket) => {
     const sid = sessionIdRef.current;
@@ -429,13 +465,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [queueTracker]);
   const applyQueueRead = useCallback((read: ReturnType<typeof captureQueueRead>, state?: AgentStateResponse, running = true) => {
-    if (!queueViewAliveRef.current || read.epoch !== queueViewEpochRef.current || sessionIdRef.current !== read.tracker.sessionId) return;
+    if (!admitView("state", read.tracker.sessionId, state, read.viewRead)) return false;
+    applyAgentState(state);
     if (state?.queue) applyQueueSnapshot(state.queue, true, read.ticket);
     else if (!running && read.tracker.absent(read.ticket)) setQueuedMessages({ steering: [], followUp: [] });
     // Unversioned state never overwrites the ordered queue view.
-  }, [applyQueueSnapshot]);
+    return true;
+  }, [applyQueueSnapshot, admitView, applyAgentState]);
 
-  const setToolPresetState = opts.setToolPreset ?? setToolPreset;
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
     ignoreProgrammaticScrollUntilRef.current = Date.now() + PROGRAMMATIC_SCROLL_IGNORE_MS;
@@ -486,11 +523,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false) => {
     let messagesLoaded = false;
+    const viewEpoch = queueViewEpochRef.current;
+    const viewRead = brainViewRef.current.capture(sid, viewEpoch);
     try {
       if (showLoading) setLoading(true);
       const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
       const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`);
+      if (sessionIdRef.current !== sid || viewEpoch !== queueViewEpochRef.current) return null;
       if (res.status === 404) {
+        if (!admitView("state", sid, undefined, viewRead)) return null;
         if (showLoading) {
           setData(null);
           setActiveLeafId(null);
@@ -501,8 +542,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as SessionData;
-      if (sessionIdRef.current !== sid) return null;
+      if (sessionIdRef.current !== sid || viewEpoch !== queueViewEpochRef.current) return null;
+      if (!admitView("snapshot", sid, d, viewRead)) return null;
+      applyAgentState(d.state);
       if (d.revision) sessionRevisionRef.current = d.revision;
+      if (d.queue) applyQueueSnapshot(d.queue, true);
       setData(d);
       setActiveLeafId(d.leafId);
       setMessages(d.context.messages);
@@ -537,7 +581,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setEntryIds(d.context.entryIds ?? []);
       setCurrentModelOverride(null);
       setError(null);
-      if (d.context.thinkingLevel && d.context.thinkingLevel !== "off") {
+      if (!d.managedBrain && d.context.thinkingLevel && d.context.thinkingLevel !== "off") {
         setThinkingLevel(d.context.thinkingLevel as ThinkingLevelOption);
       }
 
@@ -550,57 +594,71 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`);
         if (!stateRes.ok) throw new Error(`HTTP ${stateRes.status}`);
         const agentState = await stateRes.json() as { running: boolean; state?: AgentStateResponse };
-        if (sessionIdRef.current !== sid) return null;
+        if (sessionIdRef.current !== sid || viewEpoch !== queueViewEpochRef.current) return null;
 
         const liveState = agentState.state;
-        if (liveState) {
-          if (liveState.contextUsage !== undefined) setContextUsage(liveState.contextUsage ?? null);
-          if (liveState.systemPrompt !== undefined) setSystemPrompt(liveState.systemPrompt ?? null);
-          if (liveState.thinkingLevel !== undefined) setThinkingLevel((liveState.thinkingLevel as ThinkingLevelOption) ?? "auto");
-          if (liveState.extensionStatuses !== undefined) setExtensionStatuses(liveState.extensionStatuses ?? []);
-          if (liveState.extensionWidgets !== undefined) setExtensionWidgets(liveState.extensionWidgets ?? []);
-          if (liveState.sessionWait) setAgentPhase({ kind: "waiting_event", ...liveState.sessionWait });
-        }
-        applyQueueRead(queueRead, liveState, agentState.running);
+        if (!applyQueueRead(queueRead, liveState, agentState.running)) return null;
         return agentState;
       } catch (e) {
         console.error("Failed to load agent state:", e);
         return null;
       }
     } catch (e) {
-      setError(String(e));
+      if (sessionIdRef.current === sid && viewEpoch === queueViewEpochRef.current) setError(String(e));
       return null;
     } finally {
-      if (showLoading && !messagesLoaded) setLoading(false);
+      if (showLoading && !messagesLoaded && sessionIdRef.current === sid && viewEpoch === queueViewEpochRef.current) setLoading(false);
     }
-  }, [applyQueueRead, captureQueueRead]);
+  }, [applyQueueRead, applyQueueSnapshot, captureQueueRead, admitView, applyAgentState]);
+
+  refreshBrainViewRef.current = sid => {
+    void loadSession(sid).finally(() => { refreshingBrainViewRef.current = false; });
+  };
+
+  const updateConfiguration = useCallback(async (sid: string, command: Record<string, unknown>) => {
+    const managed = brainViewRef.current.managed(sid);
+    if (managed) { pendingConfigRef.current++; queueViewEpochRef.current++; }
+    try { return await sendAgentCommand(sid, command); }
+    finally {
+      if (managed) {
+        pendingConfigRef.current--; queueViewEpochRef.current++;
+        if (!pendingConfigRef.current && sessionIdRef.current === sid) await loadSession(sid);
+      }
+    }
+  }, [loadSession]);
 
   const loadContext = useCallback(async (sid: string, leafId: string | null) => {
+    if (brainViewRef.current.managed(sid)) { await loadSession(sid); return; }
+    const read = brainViewRef.current.capture(sid, queueViewEpochRef.current);
     try {
       const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
       if (leafId) params.set("leafId", leafId);
       const url = `/api/sessions/${encodeURIComponent(sid)}/context?${params}`;
       const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as { context: { messages: AgentMessage[]; entryIds: string[] } };
+      const d = await res.json() as { managedBrain?:boolean; context: { messages: AgentMessage[]; entryIds: string[] } };
+      if (d.managedBrain) { await loadSession(sid); return; }
+      if (!admitView("state", sid, undefined, read)) return;
       setMessages(d.context.messages);
       setEntryIds(d.context.entryIds ?? []);
     } catch (e) {
       console.error("Failed to load context:", e);
     }
-  }, []);
+  }, [loadSession, admitView]);
 
   const loadTools = useCallback(async (sid: string) => {
+    const read = brainViewRef.current.capture(sid, queueViewEpochRef.current);
     try {
       const tools = await sendAgentCommand<ToolEntry[]>(sid, { type: "get_tools" });
       if (tools) {
         const { getPresetFromTools } = await import("@/lib/tool-presets");
+        if (brainViewRef.current.managed(sid) || !admitView("state", sid, undefined, read)) return;
         setToolPresetState(getPresetFromTools(tools));
       }
     } catch (e) {
       console.error("Failed to load tools:", e);
     }
-  }, [setToolPresetState]);
+  }, [setToolPresetState, admitView]);
 
   const promoteNewSession = useCallback((messageCount = 0, firstMessage = "(no messages)") => {
     const sid = sessionIdRef.current;
@@ -804,7 +862,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         changed?: boolean;
         revision?: SessionRevision;
       };
-      if (result.revision) sessionRevisionRef.current = result.revision;
+      // Only an installed complete snapshot may advance this cursor.
       if (result.changed) {
         await loadSession(sid);
         // Reconnect only for realtime acceleration; loadSession is the source
@@ -983,6 +1041,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       ) return;
 
       try {
+        const queueRead = captureQueueRead(sid);
         const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
@@ -992,6 +1051,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           || !eventStreamGraceActiveRef.current
         ) return;
 
+        if (!applyQueueRead(queueRead, data.state, Boolean(data.running))) throw new Error("stale runtime view");
         const state = data.state;
         const promptActive = Boolean(data.running && state && (state.isStreaming || state.isPromptRunning));
         if (promptActive) {
@@ -1026,7 +1086,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     };
 
     eventStreamGraceTimerRef.current = setTimeout(() => void checkServerIdle(), EVENT_STREAM_IDLE_GRACE_MS);
-  }, [cancelEventStreamGrace, closeEvents]);
+  }, [cancelEventStreamGrace, closeEvents, applyQueueRead, captureQueueRead]);
 
   const finishPromptWithoutStream = useCallback(async (sid: string | null = sessionIdRef.current, runId = promptRunIdRef.current) => {
     // Bail out before loadSession too: a stale finish for a previous run
@@ -1058,13 +1118,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     while (agentRunningRef.current && Date.now() - startedAt < PROMPT_SETTLE_MAX_MS) {
       if (runId !== undefined && promptRunIdRef.current !== runId) return;
       try {
+        const queueRead = captureQueueRead(sid);
         const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
         if (res.ok) {
           const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
-          const state = data.state;
-          if (!data.running || !state || (!state.isStreaming && !state.isPromptRunning)) {
-            await finishPromptWithoutStream(sid, runId);
-            return;
+          if (applyQueueRead(queueRead, data.state, Boolean(data.running))) {
+            const state = data.state;
+            if (!data.running || !state || (!state.isStreaming && !state.isPromptRunning)) {
+              await finishPromptWithoutStream(sid, runId);
+              return;
+            }
           }
         }
       } catch {
@@ -1072,7 +1135,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       await delay(PROMPT_SETTLE_POLL_MS);
     }
-  }, [finishPromptWithoutStream]);
+  }, [finishPromptWithoutStream, applyQueueRead, captureQueueRead]);
 
   const waitForBashSettlement = useCallback(async (sid: string) => {
     const recoveryId = bashRecoveryIdRef.current + 1;
@@ -1085,9 +1148,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     ) {
       await delay(BASH_STATE_RECONCILE_MS);
       try {
+        const queueRead = captureQueueRead(sid);
         const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
         if (!res.ok) continue;
         const data = await res.json() as { state?: AgentStateResponse };
+        if (!applyQueueRead(queueRead, data.state)) continue;
         if (data.state?.isBashRunning) continue;
 
         await loadSession(sid);
@@ -1100,7 +1165,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // Keep polling while the page is mounted; network recovery is transparent.
       }
     }
-  }, [loadSession]);
+  }, [loadSession, applyQueueRead, captureQueueRead]);
 
   // Reconcile client streaming state with the server. When SSE events are
   // missed (network drop, mobile tab backgrounded, half-open connection),
@@ -1120,21 +1185,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // flight) — everything in it is stale, drop it.
       if (promptRunIdRef.current !== runId) return;
       const state = data.state;
+      if (!applyQueueRead(queueRead, state, Boolean(data.running))) return;
       // Mirror compaction state unconditionally: a missed compaction_end
       // would otherwise leave the "Stop compaction" UI stuck. No state
       // (wrapper destroyed) means nothing is compacting.
       setIsCompacting(state?.isCompacting ?? false);
-      applyQueueRead(queueRead, state, Boolean(data.running));
       if (state?.sessionWait) setAgentPhase({ kind: "waiting_event", ...state.sessionWait });
       const busy = data.running && state
         && (state.isStreaming || state.isPromptRunning || state.isCompacting);
       if (busy || !agentRunningRef.current) return;
-      if (state) {
-        if (state.contextUsage !== undefined) setContextUsage(state.contextUsage ?? null);
-        if (state.systemPrompt !== undefined) setSystemPrompt(state.systemPrompt ?? null);
-        if (state.extensionStatuses !== undefined) setExtensionStatuses(state.extensionStatuses ?? []);
-        if (state.extensionWidgets !== undefined) setExtensionWidgets(state.extensionWidgets ?? []);
-      }
       await finishPromptWithoutStream(sid, runId);
     } catch {
       // Network still down — the next poll / visibility / online tick retries.
@@ -1170,7 +1229,32 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [agentRunning]);
 
   const handleAgentEvent = useCallback((event: AgentEvent) => {
+    const sid = sessionIdRef.current;
+    if (sid && event.type !== "brain_reset" && typeof event.leadership === "string"
+      && !brainViewRef.current.observeRuntime(sid, event.leadership, event.sequence)) return;
     switch (event.type) {
+      case "brain_disconnect":
+        // Provisional tokens belong to the lost connection's leadership.
+        // Accepted messages remain until the next authoritative reset.
+        dispatch({ type: "reset" });
+        break;
+      case "brain_reset": {
+        const snapshot = event.data as SessionData | undefined;
+        const state = event.state as AgentStateResponse | undefined;
+        if (!snapshot || snapshot.sessionId !== sessionIdRef.current) break;
+        if (!admitView("snapshot", snapshot.sessionId, snapshot)) break;
+        applyAgentState(state ?? snapshot.state);
+        setData(snapshot); setMessages(snapshot.context.messages); setEntryIds(snapshot.context.entryIds);
+        setActiveLeafId(snapshot.leafId); sessionRevisionRef.current = snapshot.revision ?? null;
+        optimisticUserMessageKeyRef.current = null;
+        applyQueueSnapshot(event.queue, true);
+        sdkAgentActiveRef.current = Boolean(state?.isStreaming);
+        const busy = Boolean(state?.isStreaming || state?.isPromptRunning || rpcPromptPendingRef.current);
+        agentRunningRef.current = busy; setAgentRunning(busy); setRetryInfo(null);
+        setAgentPhase(busy ? { kind: "waiting_model" } : null);
+        dispatch({ type: busy ? "start" : "reset" });
+        break;
+      }
       case "custom_message": {
         const customType = String(event.customType ?? (event.message as { customType?: unknown } | undefined)?.customType ?? "");
         if (customType === "node-bg-result") {
@@ -1197,22 +1281,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         setAgentPhase(null);
         setRetryInfo(null);
         dispatch({ type: "end" });
-        if (sessionIdRef.current) {
-          const queueRead = captureQueueRead(sessionIdRef.current);
-          loadSession(sessionIdRef.current);
-          fetch(`/api/agent/${encodeURIComponent(sessionIdRef.current)}`)
-            .then((r) => r.json())
-            .then((d: { running?: boolean; state?: AgentStateResponse }) => {
-              if (d.state?.contextUsage !== undefined) setContextUsage(d.state.contextUsage ?? null);
-              if (d.state?.systemPrompt !== undefined) setSystemPrompt(d.state.systemPrompt ?? null);
-              if (d.state?.extensionStatuses !== undefined) setExtensionStatuses(d.state.extensionStatuses ?? []);
-              if (d.state?.extensionWidgets !== undefined) setExtensionWidgets(d.state.extensionWidgets ?? []);
-              // Aborted turns can leave messages queued in pi (delivered with the
-              // next turn); dead wrapper (no state) means the queue is gone.
-              applyQueueRead(queueRead, d.state, Boolean(d.running));
-            })
-            .catch(() => {});
-        }
+        if (sessionIdRef.current) void loadSession(sessionIdRef.current, false, true);
         break;
       case "agent_settled": {
         const agentWasActive = sdkAgentActiveRef.current;
@@ -1288,7 +1357,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // Same late-event guard: after reconcile finished this run,
         // loadSession already loaded this message from the session file —
         // appending it again would duplicate it.
-        if (!agentRunningRef.current) break;
+        const formal = typeof event.messageId === "string" && Number.isSafeInteger(event.index);
+        if (formal) {
+          const sid = sessionIdRef.current;
+          if (!sid || event.sessionId !== sid) break;
+          if (!brainViewRef.current.message(sid, event.index as number, event.messageId as string)) break;
+        }
+        if (!agentRunningRef.current && !formal) break;
         const completed = event.message as AgentMessage | undefined;
         const completedDetails = (completed as AgentMessage & { details?: Record<string, unknown> } | undefined)?.details;
         const completedText = completed ? extractMessageText(completed) : "";
@@ -1327,6 +1402,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         } else if (completed) {
           setMessages((prev) => [...prev, normalizeToolCalls(completed)]);
         }
+        if (formal && completed) setEntryIds((prev) => [...prev, event.messageId as string]);
         dispatch({ type: "reset" });
         setAgentPhase({ kind: "waiting_model" });
         break;
@@ -1390,7 +1466,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         handleExtensionUiRequest(event as ExtensionUiRequest);
         break;
     }
-  }, [addNotice, cancelEventStreamGrace, handleExtensionUiRequest, loadSession, notifyPromptStage, onAgentEnd, scheduleEventStreamClose, scrollToBottom, settleUiStage, applyQueueRead, applyQueueSnapshot, captureQueueRead]);
+  }, [addNotice, cancelEventStreamGrace, handleExtensionUiRequest, loadSession, notifyPromptStage, onAgentEnd, scheduleEventStreamClose, scrollToBottom, settleUiStage, applyQueueRead, applyQueueSnapshot, captureQueueRead, admitView, applyAgentState]);
   handleAgentEventRef.current = handleAgentEvent;
 
   const handleSend = useCallback(async (message: string, images?: AttachedImage[]) => {
@@ -1602,7 +1678,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
       if (!sid) return;
       try {
-        await sendAgentCommand(sid, { type: "set_model", provider, modelId });
+        await updateConfiguration(sid, { type: "set_model", provider, modelId });
       } catch (e) {
         console.error("Failed to set model:", e);
       }
@@ -1611,12 +1687,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const sid = sessionIdRef.current;
     if (!sid) return;
     try {
-      await sendAgentCommand(sid, { type: "set_model", provider, modelId });
-      setCurrentModelOverride({ provider, modelId });
+      await updateConfiguration(sid, { type: "set_model", provider, modelId });
+      if (!brainViewRef.current.managed(sid) && sessionIdRef.current === sid) setCurrentModelOverride({ provider, modelId });
     } catch (e) {
       console.error("Failed to set model:", e);
     }
-  }, [isNew, setNewSessionModel]);
+  }, [isNew, setNewSessionModel, updateConfiguration]);
 
   const handleCompact = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -1838,7 +1914,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const tracker = queueTracker(sid);
       if (!tracker.snapshot) {
         const read = captureQueueRead(sid);
-        const response = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
+        const response = await fetch(`/api/agent/${encodeURIComponent(sid)}?queue=1`);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json() as { running?: boolean; state?: AgentStateResponse };
         applyQueueRead(read, data.state, Boolean(data.running));
@@ -1864,11 +1940,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
     if (!sid) return;
     try {
-      await sendAgentCommand(sid, { type: "set_thinking_level", level });
+      await updateConfiguration(sid, { type: "set_thinking_level", level });
     } catch (e) {
       console.error("Failed to set thinking level:", e);
     }
-  }, [isNew]);
+  }, [isNew, updateConfiguration]);
 
   const handleToolPresetChange = useCallback(async (preset: "none" | "default" | "full") => {
     const toolNames = getToolNamesForPreset(preset);
@@ -1876,11 +1952,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
     if (!sid) return;
     try {
-      await sendAgentCommand(sid, { type: "set_tools", toolNames });
+      await updateConfiguration(sid, { type: "set_tools", toolNames });
     } catch (e) {
       console.error("Failed to set tools:", e);
     }
-  }, [setToolPresetState]);
+  }, [setToolPresetState, updateConfiguration]);
 
   const scrollUserMsgToTop = useCallback(() => {
     const container = scrollContainerRef.current;
@@ -1929,7 +2005,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   useEffect(() => {
     if (session) {
       sessionIdRef.current = session.id;
+      const epoch = queueViewEpochRef.current;
       loadSession(session.id, true, true).then((agentState) => {
+        if (sessionIdRef.current !== session.id || epoch !== queueViewEpochRef.current) return;
+        if (agentState && !applyQueueRead(captureQueueRead(session.id), agentState.state, agentState.running)) return;
         if (agentState?.running) {
           loadTools(session.id);
           if (agentState.state?.isStreaming || agentState.state?.isPromptRunning) {
@@ -1951,14 +2030,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             void waitForBashSettlement(session.id);
           }
         }
-        if (agentState?.state) {
-          if (agentState.state.isCompacting !== undefined) setIsCompacting(agentState.state.isCompacting);
-          if (agentState.state.contextUsage !== undefined) setContextUsage(agentState.state.contextUsage ?? null);
-          if (agentState.state.systemPrompt !== undefined) setSystemPrompt(agentState.state.systemPrompt ?? null);
-          if (agentState.state.thinkingLevel !== undefined) setThinkingLevel((agentState.state.thinkingLevel as ThinkingLevelOption) ?? "auto");
-          if (agentState.state.extensionStatuses !== undefined) setExtensionStatuses(agentState.state.extensionStatuses ?? []);
-          if (agentState.state.extensionWidgets !== undefined) setExtensionWidgets(agentState.state.extensionWidgets ?? []);
-        }
+
       });
     }
     return () => {

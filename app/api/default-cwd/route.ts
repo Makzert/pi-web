@@ -7,6 +7,7 @@ import { allowFileRoot } from "@/lib/file-access";
 // POST /api/default-cwd
 // Creates ~/pi-cwd-<YYYYMMDD> if it doesn't exist and returns the path.
 export async function POST() {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return NextResponse.json({ cwd: process.env.BRAIN_PROJECT_CWD ?? "/", managedBrain: true });
   try {
     const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
     const dir = join(homedir(), `pi-cwd-${date}`);

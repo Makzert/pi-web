@@ -26,6 +26,8 @@ function getAssistantText(message: AssistantMessage): string {
 }
 
 export async function POST(req: Request) {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return NextResponse.json({ error: "Configure providers, plugins and skills on the Brain Hosts; Web-local resource settings are unavailable in managed mode" }, { status: 409 });
+
   if (!isApiRequestAllowed(req)) {
     return NextResponse.json({ ok: false, error: "Untrusted API request" }, { status: 403 });
   }

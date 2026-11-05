@@ -139,7 +139,7 @@ test("session waiting stays active and stale wait-end events cannot overwrite a 
 });
 
 test("refresh and reconciliation restore the server wait state instead of showing model thinking", () => {
-  assert.match(source, /if \(liveState\.sessionWait\) setAgentPhase\(\{ kind: "waiting_event", \.\.\.liveState\.sessionWait \}\)/);
+  assert.match(source, /if \(state\.sessionWait\) setAgentPhase\(\{ kind: "waiting_event", \.\.\.state\.sessionWait \}\)/);
   assert.match(source, /if \(state\?\.sessionWait\) setAgentPhase/);
   assert.match(source, /setAgentPhase\(agentState\.state\.sessionWait \? \{ kind: "waiting_event"/);
 });

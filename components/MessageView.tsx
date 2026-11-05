@@ -3,6 +3,7 @@
 import { Fragment, memo, useState, useRef, useEffect, useMemo, type ReactNode } from "react";
 import { MarkdownBody } from "./MarkdownBody";
 import { VideoPreview } from "./VideoPreview";
+import { PersistentResult, findResultReference } from "./PersistentResult";
 import { copyText } from "@/lib/clipboard";
 import { useI18n } from "@/hooks/useI18n";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
@@ -139,7 +140,7 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
     if ((message as CustomMessage).customType === "compaction") {
       return <CompactionMessageView message={message as CustomMessage} />;
     }
-    return <CustomMessageView message={message as CustomMessage} cwd={cwd} onOpenFile={onOpenFile} />;
+    return <CustomMessageView message={message as CustomMessage} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} />;
   }
   if (message.role === "bashExecution") {
     return <BashExecutionView message={message as BashExecutionMessage} sessionId={sessionId} />;
@@ -871,7 +872,7 @@ function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCal
     const duration = toolCallDurations?.get(tc.toolCallId);
     if (isVisualToolCallBlock(tc)) {
       if (result?.isError) {
-        return <ToolCallBlock block={tc} result={result} duration={duration} />;
+        return <ToolCallBlock block={tc} result={result} duration={duration} sessionId={sessionId} />;
       }
       const legacyName = (tc as ToolCallContent & { name?: unknown }).name;
       // node_image / node_image_user: user-facing inline preview (mediaUrl in details).
@@ -887,9 +888,9 @@ function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCal
         return <VideoToolResult block={tc} result={result} />;
       }
       // node_video_model: metadata-only for the model; no user-facing player.
-      return <ToolCallBlock block={tc} result={result} duration={duration} />;
+      return <ToolCallBlock block={tc} result={result} duration={duration} sessionId={sessionId} />;
     }
-    return <ToolCallBlock block={tc} result={result} duration={duration} />;
+    return <ToolCallBlock block={tc} result={result} duration={duration} sessionId={sessionId} />;
   }
   return null;
 }
@@ -981,7 +982,7 @@ function ThinkingBlock({ block, duration, sessionId, entryId, blockIndex }: {
 }
 
 
-function ToolCallBlock({ block, result, duration }: { block: ToolCallContent; result?: ToolResultMessage; duration?: number }) {
+function ToolCallBlock({ block, result, duration, sessionId }: { block: ToolCallContent; result?: ToolResultMessage; duration?: number; sessionId?: string }) {
   const [expanded, setExpanded] = useState(false);
   const inputStr = JSON.stringify(block.input, null, 2);
   const isEditTool = isEditToolName(block.toolName);
@@ -993,6 +994,7 @@ function ToolCallBlock({ block, result, duration }: { block: ToolCallContent; re
     : null;
   const resultIsEmpty = resultText === null ? false : (resultText.trim() === "(no output)" || resultText.trim() === "");
   const isError = result?.isError ?? false;
+  const persistent = result ? findResultReference(result.details, resultText) : null;
 
   return (
     <div
@@ -1070,6 +1072,7 @@ function ToolCallBlock({ block, result, duration }: { block: ToolCallContent; re
           />
         )
       )}
+      {expanded && persistent && sessionId && <PersistentResult sessionId={sessionId} reference={persistent} />}
     </div>
   );
 }
@@ -1438,7 +1441,7 @@ function CompactionFileList({ title, files }: { title: string; files: string[] }
   );
 }
 
-function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessage; cwd?: string; onOpenFile?: (filePath: string) => void }) {
+function CustomMessageView({ message, cwd, onOpenFile, sessionId }: { message: CustomMessage; cwd?: string; onOpenFile?: (filePath: string) => void; sessionId?: string }) {
   const { t } = useI18n();
   const isHiddenDisplay = message.display === false;
   const [contentExpanded, setContentExpanded] = useState(!isHiddenDisplay);
@@ -1449,6 +1452,7 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
   const hasDetails = message.details !== undefined;
   const detailsText = hasDetails ? safeJson(message.details) : "";
   const title = formatCustomType(message.customType);
+  const persistent = findResultReference(message.details, text);
   const time = formatTime(message.timestamp);
 
   const copyContent = () => {
@@ -1527,6 +1531,7 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
              {text ? previewText(text) : t("i18n.showExtensionMessage")}
           </button>
         )}
+        {persistent && sessionId && <PersistentResult sessionId={sessionId} reference={persistent} />}
 
         <div
           style={{

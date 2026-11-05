@@ -22,6 +22,10 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") {
+    const { brainEventResponse } = await import("@/lib/brain-stream");
+    return brainEventResponse(req, id);
+  }
 
   // Fast path: already-running session
   let session = getRpcSession(id);

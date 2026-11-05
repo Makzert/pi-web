@@ -11,6 +11,7 @@ import {
 
 // GET /api/cwd/browse?path=...：列出文件系统中的可读子目录。
 export async function GET(request: NextRequest) {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return NextResponse.json({ error: "Managed Brain uses a project context path; use Node tools to browse remote files" }, { status: 409 });
   try {
     const requested = request.nextUrl.searchParams.get("path")?.trim();
 

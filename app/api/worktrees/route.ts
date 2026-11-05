@@ -15,6 +15,7 @@ async function checkCwdAllowed(cwd: string): Promise<NextResponse | null> {
 
 // GET /api/worktrees?cwd=  →  { projectRoot, isGit, isTopLevel, worktrees }
 export async function GET(req: Request) {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return NextResponse.json({ error: "Web-local worktrees are unavailable for managed Brain sessions" }, { status: 409 });
   try {
     const cwd = new URL(req.url).searchParams.get("cwd");
     if (!cwd) {
@@ -50,6 +51,7 @@ export async function GET(req: Request) {
 
 // POST /api/worktrees  body: { cwd, branch }  →  { path, branch }
 export async function POST(req: Request) {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return NextResponse.json({ error: "Web-local worktrees are unavailable for managed Brain sessions" }, { status: 409 });
   try {
     const body = await req.json() as { cwd?: string; branch?: string };
     if (!body.cwd || typeof body.cwd !== "string") {
@@ -74,6 +76,7 @@ export async function POST(req: Request) {
 
 // DELETE /api/worktrees  body: { cwd, path, force? }
 export async function DELETE(req: Request) {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return NextResponse.json({ error: "Web-local worktrees are unavailable for managed Brain sessions" }, { status: 409 });
   try {
     const body = await req.json() as { cwd?: string; path?: string; force?: boolean };
     if (!body.cwd || typeof body.cwd !== "string") {

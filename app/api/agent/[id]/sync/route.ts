@@ -38,6 +38,13 @@ export async function GET(
 ) {
   const { id } = await params;
   try {
+    if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") {
+      const { brainHostClient, brainErrorResponse } = await import("@/lib/brain-host");
+      try { const state = await brainHostClient().state(id); const revision = { lastEntryId: `brain-${state.index}`, modifiedMs: state.index, size: state.index };
+        const since = new URL(req.url).searchParams.get("since");
+        return NextResponse.json({ sessionId: id, changed: since !== JSON.stringify(revision), revision, running: true, state });
+      } catch (error) { return brainErrorResponse(error); }
+    }
     const filePath = await resolveSessionPath(id);
     if (!filePath) return NextResponse.json({ error: "Session not found" }, { status: 404 });
 

@@ -9,6 +9,8 @@ type Params = { params: Promise<{ provider: string }> };
 
 // GET /api/auth/api-key/[provider] — returns auth status (never returns the actual key)
 export async function GET(_req: Request, { params }: Params) {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return NextResponse.json({ error: "Configure providers, plugins and skills on the Brain Hosts; Web-local resource settings are unavailable in managed mode" }, { status: 409 });
+
   const { provider } = await params;
   const modelRuntime = await ModelRuntime.create();
   const status = modelRuntime.getProviderAuthStatus(provider);
@@ -19,6 +21,8 @@ export async function GET(_req: Request, { params }: Params) {
 
 // POST /api/auth/api-key/[provider]  body: { apiKey: string }
 export async function POST(req: Request, { params }: Params) {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return NextResponse.json({ error: "Configure providers, plugins and skills on the Brain Hosts; Web-local resource settings are unavailable in managed mode" }, { status: 409 });
+
   const { provider } = await params;
   try {
     const { apiKey } = await req.json() as { apiKey?: string };
@@ -60,6 +64,8 @@ export async function POST(req: Request, { params }: Params) {
 
 // DELETE /api/auth/api-key/[provider] — removes stored API key
 export async function DELETE(_req: Request, { params }: Params) {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return NextResponse.json({ error: "Configure providers, plugins and skills on the Brain Hosts; Web-local resource settings are unavailable in managed mode" }, { status: 409 });
+
   const { provider } = await params;
   try {
     const removal = await removeStoredCredentialIfType(provider, "api_key");

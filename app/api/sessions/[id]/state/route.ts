@@ -8,6 +8,10 @@ export async function GET(
 ) {
   const { id } = await params;
   try {
+    if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") {
+      const { brainHostClient, brainErrorResponse } = await import("@/lib/brain-host");
+      try { return NextResponse.json({ running: true, state: await brainHostClient().state(id) }); } catch (error) { return brainErrorResponse(error); }
+    }
     if (!await resolveSessionPath(id)) {
       return NextResponse.json({ error: "Session not found" }, { status: 404 });
     }

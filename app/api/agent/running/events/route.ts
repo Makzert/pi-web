@@ -6,6 +6,18 @@ export const dynamic = "force-dynamic";
 // session ids. Pushes an update whenever any session starts or stops working,
 // so the sidebar never has to poll.
 export async function GET(req: Request) {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") {
+    const { brainHostClient } = await import("@/lib/brain-host");
+    const client = brainHostClient(); let cleanup = () => {};
+    const stream = new ReadableStream({ start(controller) {
+      const encoder = new TextEncoder(); let closed = false; let busy = false;
+      const poll = async () => { if (closed || busy) return; busy = true; try { const { runningSessionIds } = await client.listing(); if (!closed) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "running", runningSessionIds })}\n\n`)); } catch { /* preserve last confirmed running view while disconnected */ } finally { busy = false; } };
+      const timer = setInterval(() => { void poll(); }, 2500);
+      cleanup = () => { if (closed) return; closed = true; clearInterval(timer); req.signal.removeEventListener("abort", cleanup); try { controller.close(); } catch {} };
+      req.signal.addEventListener("abort", cleanup, { once: true }); if (req.signal.aborted) cleanup(); else void poll();
+    }, cancel() { cleanup(); } });
+    return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } });
+  }
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();

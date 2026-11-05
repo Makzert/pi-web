@@ -29,10 +29,14 @@ function writeModelsJson(data: Record<string, unknown>): void {
 }
 
 export async function GET() {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return NextResponse.json({ error: "Configure providers, plugins and skills on the Brain Hosts; Web-local resource settings are unavailable in managed mode" }, { status: 409 });
+
   return NextResponse.json(readModelsJson());
 }
 
 export async function PUT(req: Request) {
+  if (process.env.BRAIN_HOST_URL || process.env.BRAIN_HOST_URLS || process.env.ULTRON_MANAGED_BRAIN === "1") return NextResponse.json({ error: "Configure providers, plugins and skills on the Brain Hosts; Web-local resource settings are unavailable in managed mode" }, { status: 409 });
+
   try {
     const body = await req.json() as Record<string, unknown>;
     writeModelsJson(body);
